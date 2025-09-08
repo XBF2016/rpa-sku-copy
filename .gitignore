@@ -146,14 +146,9 @@ cython_debug/
 *.iml
 
 # Logs
-*.log
-log/
+# *.log
+# log/
 
 # Browser driver
 msedgedriver.exe
 
-# Product URLs
-product-url.txt
-
-# Local configuration
-browser.txt
