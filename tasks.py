@@ -631,3 +631,54 @@ def _append_to_log(message):
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(clean_log_line)
             f.flush()
+
+
+def main():
+    """
+    RPA任务统一入口函数
+    按顺序执行所有RPA任务
+    """
+    try:
+        print("=" * 50)
+        print("开始执行RPA任务...")
+        print("=" * 50)
+        
+        # 1. 打开已登录的Edge浏览器
+        print("\n[步骤1/3] 正在启动Edge浏览器...")
+        open_edge_logged_in()
+        print("✓ Edge浏览器已启动")
+        
+        # 2. 打开商品页面
+        print("\n[步骤2/3] 正在打开商品页面...")
+        open_product_page()
+        print("✓ 商品页面已打开")
+        
+        # 3. 提取SKU维度信息
+        print("\n[步骤3/3] 正在提取SKU维度信息...")
+        extract_sku_dimensions()
+        print("✓ SKU维度信息提取完成")
+        
+        # 4. 遍历所有SKU组合
+        print("\n[额外步骤] 开始遍历所有SKU组合...")
+        traverse_all_sku_combinations()
+        print("✓ SKU组合遍历完成")
+        
+        print("\n" + "=" * 50)
+        print("所有RPA任务执行完成！")
+        print("=" * 50)
+        
+    except Exception as e:
+        print(f"\n[错误] 执行过程中出现异常: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    finally:
+        # 确保所有进程都被正确清理
+        _kill_driver_processes()
+    
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
