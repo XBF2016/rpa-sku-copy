@@ -177,8 +177,14 @@ def traverse_all_sku_combinations():
     options.add_argument("--profile-directory=Default")
     # 防检测设置
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])  # 排除日志开关，减少控制台输出
     options.add_experimental_option('useAutomationExtension', False)
+    # 降低浏览器日志级别，仅保留致命错误；并关闭日志输出、禁用QUIC，忽略证书错误（便于自动化环境）
+    options.add_argument("--log-level=3")
+    options.add_argument("--disable-logging")
+    options.add_argument("--disable-quic")
+    options.add_argument("--ignore-certificate-errors")
+    options.set_capability("acceptInsecureCerts", True)
     
     driver_path = _find_msedgedriver_path()
     if not driver_path:
@@ -186,7 +192,13 @@ def traverse_all_sku_combinations():
         raise RuntimeError("未找到本地 EdgeDriver")
 
     print(f"[信息] 使用本地 EdgeDriver: {driver_path}")
-    driver = webdriver.Edge(service=EdgeService(executable_path=driver_path), options=options)
+    # 将 EdgeDriver 的日志输出重定向到空设备，避免把浏览器/驱动内部日志打印到 Python 控制台
+    try:
+        service = EdgeService(executable_path=driver_path, log_output=subprocess.DEVNULL)
+    except TypeError:
+        # 兼容旧版 selenium 不支持 log_output 参数的情况
+        service = EdgeService(executable_path=driver_path)
+    driver = webdriver.Edge(service=service, options=options)
     
     # 设置较短的隐式等待和脚本执行器
     driver.implicitly_wait(1)  # 从10秒减少到1秒
@@ -331,37 +343,77 @@ def traverse_all_sku_combinations():
                 # 等待价格更新（较短时间）
                 time.sleep(0.3)
                 
-                # 快速获取价格信息（优化版）
+                # 快速获取价格信息（基于实际页面结构优化）
                 price = "未获取到价格"
+                discount_price = ""  # 券后价格
+                original_price = ""  # 优惠前价格
+                
                 try:
-                    # 使用更高效的方法：先尝试最常见的选择器
-                    main_selectors = [
-                        ".price--yeTcvSlD .number--ZQ6CbUNc",  # 淘宝最常见价格选择器
-                        ".tm-price-current",
-                        "[class*='price'] [class*='number']"
-                    ]
-                    
                     # 临时设置更短的隐式等待
                     driver.implicitly_wait(0.5)
                     
-                    for selector in main_selectors:
-                        try:
-                            price_element = driver.find_element(By.CSS_SELECTOR, selector)
-                            price_text = price_element.text.strip()
-                            if price_text and price_text != "":
-                                price = price_text
-                                break
-                        except Exception:
-                            continue
+                    # 方案1：基于实际页面结构的精确选择器
+                    try:
+                        # 获取券后价格（主价格）
+                        discount_price_elem = driver.find_element(By.CSS_SELECTOR, ".highlightPrice--asfw5V1e .text--jyiUrkMu")
+                        discount_price = discount_price_elem.text.strip()
+                        
+                        # 获取价格符号
+                        symbol_elem = driver.find_element(By.CSS_SELECTOR, ".highlightPrice--asfw5V1e .symbol--ZqZXkLDL")
+                        symbol = symbol_elem.text.strip()
+                        
+                        if discount_price:
+                            price = f"{symbol}{discount_price}"
+                            print(f"[价格信息] 券后价格: {price}")
+                            
+                            # 尝试获取优惠前价格
+                            try:
+                                original_price_elems = driver.find_elements(By.CSS_SELECTOR, ".subPrice--empS5uv8 .text--jyiUrkMu")
+                                if len(original_price_elems) >= 2:  # 第一个是"¥"符号，第二个是价格
+                                    original_price = original_price_elems[1].text.strip()
+                                    if original_price:
+                                        print(f"[价格信息] 优惠前价格: ¥{original_price}")
+                            except Exception:
+                                pass
+                    except Exception:
+                        # 方案2：备用的价格获取方案
+                        price_selectors = [
+                            ".beltPrice--i5j_t2w4 .text--jyiUrkMu",  # 价格区域的通用文本
+                            ".price--yeTcvSlD .number--ZQ6CbUNc",    # 原有的淘宝通用选择器
+                            ".tm-price-current",                     # 天猫价格选择器
+                            "[class*='price'] [class*='number']",    # 通用价格数字选择器
+                            "[class*='highlightPrice'] [class*='text']"  # 高亮价格文本
+                        ]
+                        
+                        for selector in price_selectors:
+                            try:
+                                price_element = driver.find_element(By.CSS_SELECTOR, selector)
+                                price_text = price_element.text.strip()
+                                if price_text and price_text != "":
+                                    # 如果没有货币符号，添加¥符号
+                                    if not ('¥' in price_text or '￥' in price_text):
+                                        price = f"¥{price_text}"
+                                    else:
+                                        price = price_text
+                                    print(f"[价格信息] 获取到价格: {price}")
+                                    break
+                            except Exception:
+                                continue
                     
-                    # 如果还没找到，快速尝试通用方法
+                    # 方案3：如果还没找到，使用XPath通用方法
                     if price == "未获取到价格":
                         try:
-                            price_elements = driver.find_elements(By.XPATH, "//*[contains(text(), '¥') or contains(text(), '￥')]")
-                            for elem in price_elements[:2]:  # 只检查前2个
+                            # 查找包含价格符号的元素
+                            price_elements = driver.find_elements(By.XPATH, 
+                                "//*[contains(text(), '¥') or contains(text(), '￥')]")
+                            for elem in price_elements[:3]:  # 检查前3个
                                 text = elem.text.strip()
-                                if text and ('¥' in text or '￥' in text) and len(text) < 20:  # 限制长度避免获取到描述文本
+                                # 检查是否为有效价格格式（包含货币符号且长度合理）
+                                if (text and ('¥' in text or '￥' in text) and 
+                                    len(text) < 20 and 
+                                    any(char.isdigit() for char in text)):
                                     price = text
+                                    print(f"[价格信息] 通用方法获取价格: {price}")
                                     break
                         except Exception:
                             pass

@@ -144,7 +144,9 @@ cython_debug/
 .idea/
 *.iml
 
+# 日志
 *.log
+log
 
 
 
