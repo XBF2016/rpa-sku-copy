@@ -53,3 +53,9 @@
   - 全表样式：所有单元格均设置为“水平居中 + 垂直居中 + 自动换行”。
   - 列宽：除“图片/图片链接”外的文本列，会根据内容长度做近似自适应列宽（限定在 10~40 之间，避免过宽/过窄）。
   - “价格”列表头识别为“价格”时会以纯数值写入（自动去掉货币符号与千分位），方便后续做数值计算与筛选。
+  - 主图提取：`sku_utils.get_main_image_url()` 已增强：
+    - 顺序：`<img>.currentSrc/src/srcset/placeholder/data-src/data-ks-lazyload/...`、`<picture><source srcset>`；
+    - 兜底：放大镜容器 `.js-image-zoom__zoomed-image` 的 `background-image`；`[class*='mainPicWrap']` 自身的 `background-image`；
+    - 最终兜底：在全局尝试若干主图候选选择器，必要时使用 `meta[property='og:image']` / `link[rel=image_src]`；
+    - 兼容以 `//` 开头的协议相对地址（自动补全为 `https:`）；
+    - 在点击SKU后做短轮询等待（~0.8s）并尝试触发一次主图区域的悬停，以促使放大镜背景图预加载。

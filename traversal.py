@@ -141,6 +141,15 @@ def handle_single_combination(
         price = get_price_text(driver)
         image_url = get_main_image_url(driver)
         t_price_end = time.perf_counter()
+        # 调试输出主图URL，便于快速定位问题
+        try:
+            print(f"[图片] 链接: {image_url if image_url else '空'}")
+            try:
+                append_to_log(f"图片链接: {image_url if image_url else '空'}")
+            except Exception:
+                pass
+        except Exception:
+            pass
         if not first_select_logged:
             first_select_logged = True
             log_debug(
