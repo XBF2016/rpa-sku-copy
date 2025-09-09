@@ -16,21 +16,21 @@ from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.edge.service import Service as EdgeService
 
 
-# 统一的页面元素选择器常量，便于维护与复用
-SKU_ITEM_SELECTOR = ".skuItem--Z2AJB9Ew"
-SKU_OPTION_SELECTOR = ".valueItem--smR4pNt4"
-DIM_LABEL_SELECTOR = ".ItemLabel--psS1SOyC span.f-els-2"
+# 统一的页面元素选择器常量，便于维护与复用（避免写死哈希后缀）
+SKU_ITEM_SELECTOR = "[class*='skuItem']"
+SKU_OPTION_SELECTOR = "[class*='valueItem']:not([class*='ImgWrap'])"
+DIM_LABEL_SELECTOR = "[class*='ItemLabel'] span.f-els-2"
 OPTION_TEXT_SELECTOR = "span.f-els-1"
 
-# 价格相关选择器
-PRICE_MAIN_TEXT = ".highlightPrice--asfw5V1e .text--jyiUrkMu"
-PRICE_SYMBOL = ".highlightPrice--asfw5V1e .symbol--ZqZXkLDL"
-ORIG_PRICE_TEXTS = ".subPrice--empS5uv8 .text--jyiUrkMu"
+# 价格相关选择器（主选择器仍优先，配合兜底）
+PRICE_MAIN_TEXT = "[class*='highlightPrice'] [class*='text']"
+PRICE_SYMBOL = "[class*='highlightPrice'] [class*='symbol']"
+ORIG_PRICE_TEXTS = "[class*='subPrice'] [class*='text']"
 PRICE_ALT_SELECTORS = [
-    ".beltPrice--i5j_t2w4 .text--jyiUrkMu",
-    ".price--yeTcvSlD .number--ZQ6CbUNc",
-    ".tm-price-current",
+    "[class*='beltPrice'] [class*='text']",
+    "[class*='priceWrap'] [class*='text']",
     "[class*='price'] [class*='number']",
+    ".tm-price-current",
     "[class*='highlightPrice'] [class*='text']",
 ]
 
@@ -45,6 +45,47 @@ def _normalize_price_text(txt: str) -> str:
     # 将 '¥'(U+00A5) 统一替换为 '￥'(U+FFE5)
     return (txt or "").replace("¥", "￥").strip()
 
+
+# 调试日志开关（通过环境变量 DEBUG_RPA 控制）
+def _debug_on() -> bool:
+    try:
+        v = os.environ.get("DEBUG_RPA", "").strip().lower()
+        return v in ("1", "true", "yes", "y", "on")
+    except Exception:
+        return False
+
+
+def _read_current_selected_vids(driver: webdriver.Edge, dims_count: int) -> List[str]:
+    """读取当前页面中每个维度已选中的 data-vid（若未选中返回空字符串）。"""
+    vids: List[str] = []
+    try:
+        sku_items = driver.find_elements(By.CSS_SELECTOR, SKU_ITEM_SELECTOR)
+        for idx in range(min(dims_count, len(sku_items))):
+            item = sku_items[idx]
+            selected = ""
+            try:
+                candidates = item.find_elements(By.CSS_SELECTOR, f"{SKU_OPTION_SELECTOR}[data-vid]")
+                for el in candidates:
+                    if _is_selected_element(el):
+                        v = el.get_attribute("data-vid") or ""
+                        if v:
+                            selected = v
+                            break
+            except Exception:
+                pass
+            vids.append(selected)
+    except Exception:
+        pass
+    return vids
+
+def _log_debug(message: str) -> None:
+    """输出调试信息（控制台 + 日志文件），仅在开启调试时生效。"""
+    if _debug_on():
+        print(f"[调试] {message}")
+        try:
+            _append_to_log(f"调试: {message}")
+        except Exception:
+            pass
 
 # 数据模型：更通用、更可读
 @dataclass(frozen=True)
@@ -203,12 +244,22 @@ def _read_product_url() -> str:
 def _prepare_clean_edge_state() -> None:
     """准备干净的 Edge 运行环境，确保不受残留进程影响。"""
     print("[步骤] 检查并关闭现有的 Edge 进程...")
+    t_all0 = time.perf_counter()
     if _is_process_running("msedge.exe"):
         print("[信息] 检测到 Edge 正在运行，关闭所有 Edge 相关进程...")
+        t0 = time.perf_counter()
         _kill_edge_processes()
-        time.sleep(2)
+        # 改为短轮询确认进程退出，避免无谓的固定 2 秒等待
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < 1.0:
+            if not _is_process_running("msedge.exe"):
+                break
+            time.sleep(0.1)
+        _log_debug(f"关闭 Edge 进程总耗时 {(time.perf_counter() - t0)*1000:.0f}ms")
     print("[步骤] 关闭可能残留的 EdgeDriver 进程...")
+    t1 = time.perf_counter()
     _kill_driver_processes()
+    _log_debug(f"关闭 EdgeDriver 进程耗时 {(time.perf_counter() - t1)*1000:.0f}ms；清理总耗时 {(time.perf_counter() - t_all0):.3f}s")
 
 
 def _init_edge_driver() -> webdriver.Edge:
@@ -216,6 +267,7 @@ def _init_edge_driver() -> webdriver.Edge:
     user_data_dir = os.path.expanduser("~\\AppData\\Local\\Microsoft\\Edge\\User Data")
 
     print("[步骤] 初始化 Edge WebDriver（使用用户登录态）...")
+    t0 = time.perf_counter()
     options = EdgeOptions()
     options.add_argument("--start-maximized")
     options.add_argument(f"--user-data-dir={user_data_dir}")
@@ -230,6 +282,11 @@ def _init_edge_driver() -> webdriver.Edge:
     options.add_argument("--disable-quic")
     options.add_argument("--ignore-certificate-errors")
     options.set_capability("acceptInsecureCerts", True)
+    # 加速页面加载：DOMContentLoaded 即返回
+    try:
+        options.set_capability("pageLoadStrategy", "eager")
+    except Exception:
+        pass
 
     driver_path = _find_msedgedriver_path()
     if not driver_path:
@@ -242,6 +299,7 @@ def _init_edge_driver() -> webdriver.Edge:
     except TypeError:
         service = EdgeService(executable_path=driver_path)
 
+    t1 = time.perf_counter()
     driver = webdriver.Edge(service=service, options=options)
     driver.implicitly_wait(1)
     # 移除 webdriver 痕迹
@@ -249,53 +307,77 @@ def _init_edge_driver() -> webdriver.Edge:
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     except Exception:
         pass
+    _log_debug(f"初始化 EdgeDriver 耗时 {(time.perf_counter() - t0):.3f}s（创建Service {(t1 - t0)*1000:.0f}ms，启动Driver {(time.perf_counter() - t1)*1000:.0f}ms）")
     return driver
 
 
 def _open_product_page(driver: webdriver.Edge, url: str, wait_timeout: int = 30) -> None:
     """打开商品页并等待 SKU 区域出现。"""
     print("[步骤] 打开商品页面...")
+    t0 = time.perf_counter()
     driver.get(url)
+    t_get = time.perf_counter()
     # 页面打开后做一个短随机等待（防检测/渲染稳定）
-    time.sleep(random.uniform(0.6, 1.2))
+    time.sleep(random.uniform(0.3, 0.6))
+    t_sleep = time.perf_counter()
     WebDriverWait(driver, wait_timeout).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, SKU_ITEM_SELECTOR))
+    )
+    t_wait = time.perf_counter()
+    _log_debug(
+        f"打开商品页: get(url) {(t_get - t0)*1000:.0f}ms；随机等待 {(t_sleep - t_get)*1000:.0f}ms；等待SKU出现 {(t_wait - t_sleep)*1000:.0f}ms；总计 {(t_wait - t0):.3f}s"
     )
 
 
 def _parse_sku_dimensions(driver: webdriver.Edge) -> List[SkuDimension]:
     """解析页面上的所有 SKU 维度与选项。"""
     print("[步骤] 解析SKU维度和选项...")
+    t0 = time.perf_counter()
+    # 通过 JS 一次性解析，减少大量 find_element 往返调用带来的开销
+    js = (
+        "return (function(itemSel, labelSel, optionSel, textSel){\n"
+        "  var items = Array.from(document.querySelectorAll(itemSel));\n"
+        "  var dims = [];\n"
+        "  for (var i=0; i<items.length; i++){\n"
+        "    var item = items[i];\n"
+        "    var label = item.querySelector(labelSel);\n"
+        "    var name = label ? (label.getAttribute('title') || label.textContent || ('维度' + (i+1))) : ('维度' + (i+1));\n"
+        "    var opts = [];\n"
+        "    var nodes = Array.from(item.querySelectorAll(optionSel));\n"
+        "    for (var j=0; j<nodes.length; j++){\n"
+        "      var el = nodes[j];\n"
+        "      var dis = (el.getAttribute('data-disabled') || '').toLowerCase() === 'true';\n"
+        "      if (dis) continue;\n"
+        "      var vid = el.getAttribute('data-vid');\n"
+        "      var span = el.querySelector(textSel);\n"
+        "      var txt = span ? (span.getAttribute('title') || span.textContent || '').trim() : '';\n"
+        "      if (vid && txt){ opts.push({vid: vid, text: txt}); }\n"
+        "    }\n"
+        "    if (opts.length){ dims.push({name: name.trim(), options: opts}); }\n"
+        "  }\n"
+        "  return dims;\n"
+        "})(arguments[0], arguments[1], arguments[2], arguments[3]);"
+    )
+
+    dims_data = driver.execute_script(
+        js,
+        SKU_ITEM_SELECTOR,
+        DIM_LABEL_SELECTOR,
+        f"{SKU_OPTION_SELECTOR}[data-vid]",
+        OPTION_TEXT_SELECTOR,
+    ) or []
+
     sku_dimensions: List[SkuDimension] = []
-    sku_items = driver.find_elements(By.CSS_SELECTOR, SKU_ITEM_SELECTOR)
+    try:
+        for d in dims_data:
+            name = (d.get('name') or '').strip() or '未命名维度'
+            opts = [SkuOption(vid=str(o.get('vid') or ''), text=str(o.get('text') or '').strip()) for o in (d.get('options') or [])]
+            if opts:
+                sku_dimensions.append(SkuDimension(name=name, options=opts))
+    except Exception as e:
+        _log_debug(f"JS 解析SKU异常: {e}")
 
-    for idx, item in enumerate(sku_items, start=1):
-        # 维度名
-        try:
-            dim_label = item.find_element(By.CSS_SELECTOR, DIM_LABEL_SELECTOR)
-            dim_name = dim_label.get_attribute("title") or dim_label.text or f"维度{idx}"
-        except Exception:
-            dim_name = f"维度{idx}"
-
-        # 选项集合
-        options: List[SkuOption] = []
-        option_elements = item.find_elements(By.CSS_SELECTOR, SKU_OPTION_SELECTOR)
-        for opt_elem in option_elements:
-            try:
-                # 跳过不可用
-                if (opt_elem.get_attribute("data-disabled") or "").lower() == "true":
-                    continue
-                data_vid = opt_elem.get_attribute("data-vid")
-                span = opt_elem.find_element(By.CSS_SELECTOR, OPTION_TEXT_SELECTOR)
-                option_text = (span.get_attribute("title") or span.text or "").strip()
-                if data_vid and option_text:
-                    options.append(SkuOption(vid=data_vid, text=option_text))
-            except Exception:
-                continue
-
-        if options:
-            sku_dimensions.append(SkuDimension(name=dim_name.strip(), options=options))
-
+    _log_debug(f"解析SKU维度完成：{len(sku_dimensions)} 个维度；耗时 {(time.perf_counter() - t0):.3f}s")
     return sku_dimensions
 
 
@@ -331,9 +413,11 @@ def _ensure_combination_selected(
 
     # 如果没有变化，直接返回
     if not need_change_indices:
+        _log_debug(f"点击SKU: 本次无需变更（沿用上次选择），维度索引 {list(range(len(combination)))}")
         return [opt.vid for opt in combination]
 
     # 首轮：只点击有变化的维度
+    t_click0 = time.perf_counter()
     for dim_idx in need_change_indices:
         option = combination[dim_idx]
         try:
@@ -366,56 +450,87 @@ def _ensure_combination_selected(
 
 
 def _get_price_text(driver: webdriver.Edge) -> str:
-    """获取当前所选组合的价格文本（JS一次性查询 + 短轮询，极限压缩等待时间）。"""
-    # 通过 execute_script 的参数传入备用选择器，避免引号转义问题
+    """获取当前所选组合的价格文本（主选择器优先 + 包含匹配兜底；JS一次性查询 + 短轮询）。"""
+    # 通过 execute_script 的参数传入选择器，避免引号转义；
+    # 一级优先：使用你指定的哈希类（PRICE_MAIN_TEXT / PRICE_SYMBOL）
+    # 二级兜底：以 beltPrice/priceWrap 为锚点，容器内找 [class*='text']/[class*='number'] 短文本
     js = (
-        "return (function(alts){\n"
-        f"  var mainText = document.querySelector('{PRICE_MAIN_TEXT}');\n"
-        f"  var symbolEl = document.querySelector('{PRICE_SYMBOL}');\n"
-        "  if (mainText && mainText.textContent) {\n"
-        "    var sym = symbolEl && symbolEl.textContent ? symbolEl.textContent.trim() : '¥';\n"
-        "    var txt = mainText.textContent.trim();\n"
-        "    if (txt) return sym + txt;\n"
-        "  }\n"
-        "  alts = Array.isArray(alts) ? alts : [];\n"
-        "  for (var i=0; i<alts.length; i++){\n"
-        "    var el = document.querySelector(alts[i]);\n"
-        "    if (el && el.textContent){\n"
-        "      var t = el.textContent.trim();\n"
-        "      if (t){\n"
-        "        if (t.indexOf('¥') !== -1 || t.indexOf('￥') !== -1) return t;\n"
-        "        return '¥' + t;\n"
+        "return (function(mainSel, symSel, alts, beltSel, wrapSel, nodeSel){\n"
+        "  function pickFromMain(){\n"
+        "    try{\n"
+        "      var mainText = document.querySelector(mainSel);\n"
+        "      var symbolEl = document.querySelector(symSel);\n"
+        "      if (mainText && mainText.textContent){\n"
+        "        var sym = symbolEl && symbolEl.textContent ? symbolEl.textContent.trim() : '¥';\n"
+        "        var txt = mainText.textContent.trim();\n"
+        "        if (txt) return sym + txt;\n"
         "      }\n"
-        "    }\n"
+        "    }catch(e){}\n"
+        "    return '';\n"
         "  }\n"
-        "  var belt = document.querySelector('.beltPrice--i5j_t2w4');\n"
-        "  if (belt){\n"
-        "    var nodes = belt.querySelectorAll(\".text--jyiUrkMu, .number--ZQ6CbUNc, [class*='number'], [class*='text']\");\n"
-        "    for (var j=0; j<nodes.length; j++){\n"
-        "      var tt = (nodes[j].textContent || '').trim();\n"
-        "      if (tt && /\\d/.test(tt)){\n"
-        "        if (tt.indexOf('¥') !== -1 || tt.indexOf('￥') !== -1) return tt;\n"
-        "        return '¥' + tt;\n"
+        "  function pickFromAlts(){\n"
+        "    try{\n"
+        "      alts = Array.isArray(alts) ? alts : [];\n"
+        "      for (var i=0; i<alts.length; i++){\n"
+        "        var el = document.querySelector(alts[i]);\n"
+        "        if (el && el.textContent){\n"
+        "          var t = el.textContent.trim();\n"
+        "          if (t){\n"
+        "            if (t.indexOf('¥') !== -1 || t.indexOf('￥') !== -1) return t;\n"
+        "            return '¥' + t;\n"
+        "          }\n"
+        "        }\n"
         "      }\n"
-        "    }\n"
+        "    }catch(e){}\n"
+        "    return '';\n"
         "  }\n"
-        "  return '';\n"
-        "})(arguments[0]);"
+        "  function pickFromBelt(){\n"
+        "    try{\n"
+        "      var belt = document.querySelector(beltSel);\n"
+        "      if (!belt) return '';\n"
+        "      var container = belt.querySelector(wrapSel) || belt;\n"
+        "      var nodes = container.querySelectorAll(nodeSel);\n"
+        "      for (var j=0; j<nodes.length; j++){\n"
+        "        var tt = (nodes[j].textContent || '').trim();\n"
+        "        if (tt && /\\d/.test(tt)){\n"
+        "          if (tt.indexOf('¥') !== -1 || tt.indexOf('￥') !== -1) return tt;\n"
+        "          return '¥' + tt;\n"
+        "        }\n"
+        "      }\n"
+        "    }catch(e){}\n"
+        "    return '';\n"
+        "  }\n"
+        "  return pickFromMain() || pickFromAlts() || pickFromBelt();\n"
+        "})(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5]);"
     )
 
     # 最多短轮询 ~300ms，提高对价格异步刷新的兼容
+    t_price0 = time.perf_counter()
     end_time = time.perf_counter() + 0.3
     last = ""
     while time.perf_counter() < end_time:
         try:
-            price = (driver.execute_script(js, PRICE_ALT_SELECTORS) or "").strip()
+            price = (
+                driver.execute_script(
+                    js,
+                    PRICE_MAIN_TEXT,  # 主价格文本（你指定的哈希类优先）
+                    PRICE_SYMBOL,     # 货币符号
+                    PRICE_ALT_SELECTORS,  # 备用选择器数组
+                    "[class*='beltPrice']",  # 价格横幅容器（示例文件出现）
+                    "[class*='priceWrap']",  # 价格包裹容器（示例文件出现）
+                    "[class*='text'], [class*='number']"  # 容器内文本/数字节点
+                )
+                or ""
+            ).strip()
             if price and any(ch.isdigit() for ch in price):
                 return _normalize_price_text(price)
             last = price
         except Exception:
             pass
         time.sleep(0.06)
-    return _normalize_price_text(last) or "未获取到价格"
+    price_final = _normalize_price_text(last) or "未获取到价格"
+    _log_debug(f"取价耗时 {(time.perf_counter() - t_price0)*1000:.0f}ms，结果 {price_final}")
+    return price_final
 
 
 
@@ -429,15 +544,22 @@ def traverse_all_sku_combinations():
     print(f"[步骤] 读取到商品链接: {url}")
 
     # 准备浏览器环境并初始化驱动
+    t_task0 = time.perf_counter()
     _prepare_clean_edge_state()
+    t_after_clean = time.perf_counter()
     driver = _init_edge_driver()
+    t_after_init = time.perf_counter()
+    _log_debug(f"阶段耗时：清理 {(t_after_clean - t_task0):.3f}s；初始化驱动 {(t_after_init - t_after_clean):.3f}s")
 
     try:
         # 打开页面并等待初始加载
         _open_product_page(driver, url, wait_timeout=30)
+        t_after_open = time.perf_counter()
 
         # 解析维度
         sku_dimensions = _parse_sku_dimensions(driver)
+        t_after_parse = time.perf_counter()
+        _log_debug(f"阶段耗时：打开页面 {(t_after_open - t_after_init):.3f}s；解析SKU {(t_after_parse - t_after_open):.3f}s")
         total_combinations = 1
         for dim in sku_dimensions:
             total_combinations *= len(dim.options)
@@ -448,6 +570,32 @@ def traverse_all_sku_combinations():
 
         print("[步骤] 开始遍历所有SKU组合...")
         combinations: List[Tuple[SkuOption, ...]] = list(itertools.product(*[d.options for d in sku_dimensions]))
+        # 将“当前页面已选中的组合”提前到第一个，尽可能避免首次点击的长停顿
+        try:
+            current_vids = _read_current_selected_vids(driver, len(sku_dimensions))
+            _log_debug(f"当前已选VID: {current_vids}")
+            if current_vids and len(current_vids) == len(sku_dimensions):
+                cur_opts: List[SkuOption] = []
+                for i, dim in enumerate(sku_dimensions):
+                    vid = current_vids[i]
+                    if not vid:
+                        cur_opts = []
+                        break
+                    found = next((o for o in dim.options if o.vid == vid), None)
+                    if not found:
+                        cur_opts = []
+                        break
+                    cur_opts.append(found)
+                if cur_opts:
+                    cur_tuple = tuple(cur_opts)
+                    if cur_tuple in combinations:
+                        combinations.remove(cur_tuple)
+                        combinations.insert(0, cur_tuple)
+                        _log_debug("已将当前已选组合置于遍历首位")
+                        # 初始化 last_selected_vids，避免对首组重复点击
+                        last_selected_vids = current_vids[:]  # type: ignore
+        except Exception as e:
+            _log_debug(f"处理当前已选组合时异常: {e}")
         # 支持通过环境变量限制前 N 个组合用于快速自测
         try:
             max_combos_str = os.environ.get("MAX_COMBOS", "").strip()
@@ -461,8 +609,13 @@ def traverse_all_sku_combinations():
 
         results: List[List[str]] = []
         success_count = 0
-        last_selected_vids: List[str] = []
+        # 如果上面未通过“当前已选组合”初始化，则为空
+        try:
+            last_selected_vids  # type: ignore
+        except NameError:
+            last_selected_vids = []
 
+        first_select_logged = False
         for combo_idx, combination in enumerate(combinations, 1):
             try:
                 print(f"\n[进度] 处理组合 {combo_idx}/{len(combinations)}")
@@ -474,10 +627,18 @@ def traverse_all_sku_combinations():
 
                 # 点击并校验
                 start_time = time.time()
+                t_click_begin = time.perf_counter()
                 last_selected_vids = _ensure_combination_selected(
                     driver, list(combination), last_selected_vids or None
                 )
+                t_click_end = time.perf_counter()
                 price = _get_price_text(driver)
+                t_price_end = time.perf_counter()
+                if not first_select_logged:
+                    first_select_logged = True
+                    _log_debug(
+                        f"首次选中耗时：点击 {(t_click_end - t_click_begin)*1000:.0f}ms；取价 {(t_price_end - t_click_end)*1000:.0f}ms；自页面就绪起 {(t_click_end - t_after_parse):.3f}s"
+                    )
                 # 再保险：统一控制台友好的货币符号
                 price = _normalize_price_text(price)
 
