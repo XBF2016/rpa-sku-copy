@@ -73,43 +73,6 @@ def _pid_running(pid: int) -> bool:
         return False
 
 
-def _acquire_single_instance_lock(name: str) -> Path:
-    """创建单实例锁，避免多个任务并发运行。
-    锁文件位于系统临时目录：<tmp>/rpa-sku-copy-<name>.lock
-    若锁已存在且对应 PID 仍在运行，则抛出异常。
-    若锁已存在但 PID 不存在，则清理后重新加锁。
-    """
-    import tempfile
-    lock_path = Path(tempfile.gettempdir()) / f"rpa-sku-copy-{name}.lock"
-    try:
-        if lock_path.exists():
-            try:
-                pid_text = lock_path.read_text(encoding="utf-8").strip()
-                pid = int(pid_text) if pid_text.isdigit() else -1
-            except Exception:
-                pid = -1
-            if _pid_running(pid):
-                raise RuntimeError(f"已有同类任务正在运行（PID={pid}），请稍后再试或手动结束该进程。")
-            # 清理僵尸锁
-            try:
-                lock_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-        # 写入当前 PID
-        lock_path.write_text(str(os.getpid()), encoding="utf-8")
-        return lock_path
-    except Exception as e:
-        raise RuntimeError(f"创建单实例锁失败：{e}")
-
-
-def _release_single_instance_lock(lock_path: Path) -> None:
-    """释放单实例锁。"""
-    try:
-        if lock_path and lock_path.exists():
-            lock_path.unlink(missing_ok=True)
-    except Exception:
-        pass
-
 
 def _find_msedgedriver_path() -> str | None:
     """在本机查找 msedgedriver.exe 的路径，尽量避免联网下载。
@@ -175,194 +138,10 @@ def _read_product_url() -> str:
     raise ValueError("product-url.txt 中没有可用的链接内容")
 
 
-@task
-def open_edge_logged_in():
-    """
-    关闭任何正在运行的 Microsoft Edge 实例，然后使用 Default 配置文件启动 Edge。
-    Default 配置文件通常会保留用户的登录状态。
-    浏览器可执行文件路径从 'browser.txt' 读取。
-    """
-    print("[步骤] 检查 Edge 是否正在运行...")
-    if _is_process_running("msedge.exe"):
-        print("[信息] 检测到 Edge 正在运行，尝试关闭所有 Edge 相关进程...")
-        _kill_edge_processes()
-        time.sleep(1.5)
-    else:
-        print("[信息] 未检测到 Edge 实例。")
-
-    exe_path = _read_browser_path()
-    exe = exe_path
-    if not os.path.exists(exe_path) and not shutil.which(exe_path):
-        print(f"[警告] 未在 '{exe_path}' 找到 Edge 可执行文件，回退为 'msedge.exe'。")
-        exe = "msedge.exe"
-
-    # 使用 Default 配置文件以复用登录状态；打开空白页并最大化窗口
-    args = [exe, "--profile-directory=Default", "--start-maximized", "about:blank"]
-    print(f"[步骤] 启动 Edge: {' '.join(args)}")
-    try:
-        subprocess.Popen(args, shell=False)
-        print("[完成] 已使用 Default 配置文件启动 Edge。若你的 Default 配置已登录，\n"
-              "       本次会话将保持登录状态。")
-    except Exception as e:
-        print(f"[错误] 启动 Edge 失败: {e}")
-        raise
 
 
-@task
-def open_product_page():
-    """
-    在不强制关闭 Edge 的情况下，读取 product-url.txt，并在 Edge 中打开该商品页面。
-    若 Edge 未在运行，则以 Default 配置文件启动并直接打开目标链接。
-    """
-    url = _read_product_url()
-    print(f"[步骤] 读取到商品链接: {url}")
-
-    exe_path = _read_browser_path()
-    exe = exe_path if os.path.exists(exe_path) or shutil.which(exe_path) else "msedge.exe"
-    if exe != exe_path:
-        print(f"[警告] 未在 '{exe_path}' 找到 Edge 可执行文件，回退为 'msedge.exe'。")
-
-    if _is_process_running("msedge.exe"):
-        # Edge 已在运行：再次调用可执行程序并传入 URL，会在现有实例中新开标签页
-        args = [exe, "--profile-directory=Default", url]
-        print(f"[步骤] Edge 已运行，尝试在现有实例中新开标签并访问商品页面...")
-    else:
-        # Edge 未运行：启动并直接打开该 URL
-        args = [exe, "--profile-directory=Default", "--start-maximized", url]
-        print(f"[步骤] Edge 未运行，尝试启动并直接访问商品页面...")
-
-    print(f"[信息] 调用命令: {' '.join(args)}")
-    try:
-        subprocess.Popen(args, shell=False)
-        print("[完成] 已在 Edge 中打开商品页面。")
-    except Exception as e:
-        print(f"[错误] 打开商品页面失败: {e}")
-        raise
 
 
-@task
-def extract_sku_dimensions():
-    """
-    打开商品页，自动识别所有 SKU 维度及其下的所有选项，并写入 log/sku维度及选项.log。
-    首先关闭现有Edge进程，然后使用用户登录态重新启动Edge。
-    定位规则严格依据你提供的元素结构与类名：
-      - 维度容器：.skuItem--Z2AJB9Ew
-      - 维度名称：.ItemLabel--psS1SOyC > span.f-els-2
-      - 选项容器：.skuValueWrap--aEfxuhNr .content--DIGuLqdf .valueItem--smR4pNt4
-      - 选项文本：选项容器内的 span.f-els-1 的 title 或文本
-    """
-    url = _read_product_url()
-    print(f"[步骤] 读取到商品链接: {url}")
-
-    # 首先关闭现有的Edge与EdgeDriver进程以避免冲突
-    print("[步骤] 检查并关闭现有的 Edge 进程...")
-    if _is_process_running("msedge.exe"):
-        print("[信息] 检测到 Edge 正在运行，关闭所有 Edge 相关进程...")
-        _kill_edge_processes()
-        time.sleep(2)  # 等待进程完全关闭
-    else:
-        print("[信息] 未检测到 Edge 实例。")
-    print("[步骤] 关闭可能残留的 EdgeDriver 进程...")
-    _kill_driver_processes()
-
-    # 获取用户数据目录以保持登录态
-    import os
-    user_data_dir = os.path.expanduser("~\\AppData\\Local\\Microsoft\\Edge\\User Data")
-    
-    print("[步骤] 初始化 Edge WebDriver（使用用户登录态）...")
-    options = EdgeOptions()
-    options.add_argument("--start-maximized")
-    options.add_argument(f"--user-data-dir={user_data_dir}")  # 使用用户数据目录保持登录态
-    options.add_argument("--profile-directory=Default")  # 使用默认配置文件
-    # 避免一些常见的安全限制
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option('useAutomationExtension', False)
-
-    # 使用本地 msedgedriver.exe，避免联网下载
-    driver_path = _find_msedgedriver_path()
-    if not driver_path:
-        print("[错误] 未找到 msedgedriver.exe。请下载与本机 Edge 版本匹配的 EdgeDriver，\n"
-              "       并将 msedgedriver.exe 放到项目根目录，或设置环境变量 MSEDGEDRIVER 指向其目录/文件。")
-        raise RuntimeError("未找到本地 EdgeDriver")
-
-    print(f"[信息] 使用本地 EdgeDriver: {driver_path}")
-    print(f"[信息] 使用用户数据目录: {user_data_dir}")
-    try:
-        driver = webdriver.Edge(service=EdgeService(executable_path=driver_path), options=options)
-    except Exception as e:
-        print(f"[错误] 初始化 Edge WebDriver 失败: {e}")
-        raise
-
-    # 单实例锁，避免并发写日志
-    lock_path = _acquire_single_instance_lock("extract")
-    try:
-        print("[步骤] 打开商品页面...")
-        driver.get(url)
-
-        wait = WebDriverWait(driver, 25)
-        # 等待至少出现一个维度块
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".skuItem--Z2AJB9Ew")))
-
-        # 收集所有维度
-        sku_items = driver.find_elements(By.CSS_SELECTOR, ".skuItem--Z2AJB9Ew")
-        print(f"[信息] 检测到维度数量: {len(sku_items)}")
-
-        results: list[str] = []
-
-        for idx, item in enumerate(sku_items, start=1):
-            # 维度名
-            dim_name = ""
-            try:
-                label_span = item.find_element(By.CSS_SELECTOR, ".ItemLabel--psS1SOyC span.f-els-2")
-                dim_name = label_span.get_attribute("title") or label_span.text or ""
-                dim_name = dim_name.strip()
-            except Exception:
-                dim_name = f"未命名维度#{idx}"
-
-            if not dim_name:
-                dim_name = f"未命名维度#{idx}"
-
-            # 选项
-            option_nodes = item.find_elements(By.CSS_SELECTOR, ".skuValueWrap--aEfxuhNr .content--DIGuLqdf .valueItem--smR4pNt4")
-            option_texts: list[str] = []
-            for opt in option_nodes:
-                text = ""
-                try:
-                    span = opt.find_element(By.CSS_SELECTOR, "span.f-els-1")
-                    text = span.get_attribute("title") or span.text or ""
-                except Exception:
-                    # 兜底：取整个节点的可见文本
-                    text = opt.text or ""
-                text = (text or "").strip()
-                if text:
-                    option_texts.append(text)
-
-            # 写入内存缓存
-            results.append(f"维度：{dim_name}")
-            if option_texts:
-                for t in option_texts:
-                    results.append(f"  - {t}")
-            else:
-                results.append("  - （无选项或未能识别）")
-
-        # 输出到日志文件
-        log_dir = Path(__file__).with_name("log")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "sku维度及选项.log"
-        print(f"[步骤] 将识别结果写入: {log_path}")
-        content = "\n".join(results) + "\n"
-        log_path.write_text(content, encoding="utf-8")
-        print("[完成] SKU 维度与选项已写入日志文件。")
-
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        # 释放锁并兜底清理驱动进程
-        _release_single_instance_lock(lock_path)
-        _kill_driver_processes()
 
 
 @task
@@ -490,7 +269,7 @@ def traverse_all_sku_combinations():
                 
                 # 记录组合信息到log文件
                 combo_info = f"{combination[0]['text']}---{combination[1]['text']}---{combination[2]['text']}"
-                _append_to_log(f"正在处理组合 {combo_idx}/{len(combinations)}: {combo_info}")
+                # _append_to_log(f"正在处理组合 {combo_idx}/{len(combinations)}: {combo_info}")
                 
                 # 依次点击每个维度的选项
                 start_time = time.time()
@@ -504,15 +283,50 @@ def traverse_all_sku_combinations():
                         option_selector = f'.valueItem--smR4pNt4[data-vid="{option["vid"]}"]'
                         option_element = current_dim.find_element(By.CSS_SELECTOR, option_selector)
                         
-                        # 使用JavaScript点击避免拦截问题
-                        driver.execute_script("arguments[0].click();", option_element)
+                        # 如果已选中则跳过点击，避免重复点击导致反选
+                        is_selected = False
+                        try:
+                            cls = (option_element.get_attribute("class") or "")
+                            if ("selected" in cls) or ("Selected" in cls) or ("active" in cls) or ("checked" in cls):
+                                is_selected = True
+                            if (option_element.get_attribute("aria-checked") or "").lower() == "true":
+                                is_selected = True
+                            if (option_element.get_attribute("data-selected") or "").lower() == "true":
+                                is_selected = True
+                        except Exception:
+                            pass
                         
-                        # 很短的延迟
-                        time.sleep(0.1)
+                        if not is_selected:
+                            driver.execute_script("arguments[0].click();", option_element)
+                            time.sleep(0.1)  # 很短的延迟
+                        else:
+                            # 已经是期望的选中状态，无需再次点击
+                            pass
                         
                     except Exception as e:
                         print(f"[警告] 点击维度{dim_idx+1}选项失败: {e}")
                         continue
+                
+                # 再次校验：若后续点击导致前面维度被反选，则补点恢复
+                try:
+                    for dim_idx, option in enumerate(combination):
+                        sku_items = driver.find_elements(By.CSS_SELECTOR, ".skuItem--Z2AJB9Ew")
+                        current_dim = sku_items[dim_idx]
+                        option_selector = f'.valueItem--smR4pNt4[data-vid="{option["vid"]}"]'
+                        option_element = current_dim.find_element(By.CSS_SELECTOR, option_selector)
+
+                        cls = (option_element.get_attribute("class") or "")
+                        attr_aria = (option_element.get_attribute("aria-checked") or "").lower()
+                        attr_data = (option_element.get_attribute("data-selected") or "").lower()
+                        still_selected = (
+                            ("selected" in cls) or ("Selected" in cls) or ("active" in cls) or ("checked" in cls)
+                            or attr_aria == "true" or attr_data == "true"
+                        )
+                        if not still_selected:
+                            driver.execute_script("arguments[0].click();", option_element)
+                            time.sleep(0.08)
+                except Exception:
+                    pass
                 
                 # 等待价格更新（较短时间）
                 time.sleep(0.3)
@@ -576,20 +390,20 @@ def traverse_all_sku_combinations():
                 
                 # 控制每个组合处理时间约1秒（减少不必要延迟）
                 elapsed_time = time.time() - start_time
-                if elapsed_time < 0.8:  # 从1秒减少到0.8秒，更快的处理速度
-                    time.sleep(0.8 - elapsed_time)
+                if elapsed_time < 1:  # 从1秒减少到0.8秒，更快的处理速度
+                    time.sleep(1 - elapsed_time)
                 
-                # 每处理一定数量的组合就保存一次结果
-                if combo_idx % 50 == 0:
-                    _append_to_log(f"中间保存: 已处理 {combo_idx} 个组合")
-                    print(f"[信息] 已处理 {combo_idx} 个组合，中间保存完成")
+                # # 每处理一定数量的组合就保存一次结果
+                # if combo_idx % 50 == 0:
+                #     _append_to_log(f"中间保存: 已处理 {combo_idx} 个组合")
+                #     print(f"[信息] 已处理 {combo_idx} 个组合，中间保存完成")
                 
-                # 防检测：每50个组合休息一下（减少频率）
-                if combo_idx % 50 == 0:
-                    delay = random.uniform(1, 2)
-                    _append_to_log(f"防检测休息 {delay:.1f} 秒...")
-                    print(f"[防检测] 休息 {delay:.1f} 秒...")
-                    time.sleep(delay)
+                # # 防检测：每50个组合休息一下（减少频率）
+                # if combo_idx % 50 == 0:
+                #     delay = random.uniform(1, 2)
+                #     _append_to_log(f"防检测休息 {delay:.1f} 秒...")
+                #     print(f"[防检测] 休息 {delay:.1f} 秒...")
+                #     time.sleep(delay)
                 
             except Exception as e:
                 print(f"[错误] 处理组合 {combo_idx} 失败: {e}")
@@ -643,22 +457,7 @@ def main():
         print("开始执行RPA任务...")
         print("=" * 50)
         
-        # 1. 打开已登录的Edge浏览器
-        print("\n[步骤1/3] 正在启动Edge浏览器...")
-        open_edge_logged_in()
-        print("✓ Edge浏览器已启动")
-        
-        # 2. 打开商品页面
-        print("\n[步骤2/3] 正在打开商品页面...")
-        open_product_page()
-        print("✓ 商品页面已打开")
-        
-        # 3. 提取SKU维度信息
-        print("\n[步骤3/3] 正在提取SKU维度信息...")
-        extract_sku_dimensions()
-        print("✓ SKU维度信息提取完成")
-        
-        # 4. 遍历所有SKU组合
+        # 遍历所有SKU组合
         print("\n[额外步骤] 开始遍历所有SKU组合...")
         traverse_all_sku_combinations()
         print("✓ SKU组合遍历完成")
