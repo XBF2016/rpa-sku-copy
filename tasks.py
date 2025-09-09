@@ -14,6 +14,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.edge.service import Service as EdgeService
+from openpyxl import Workbook
 
 
 # 统一的页面元素选择器常量，便于维护与复用（避免写死哈希后缀）
@@ -532,6 +533,171 @@ def _get_price_text(driver: webdriver.Edge) -> str:
     _log_debug(f"取价耗时 {(time.perf_counter() - t_price0)*1000:.0f}ms，结果 {price_final}")
     return price_final
 
+def _compute_total_combinations(sku_dimensions: List[SkuDimension]) -> int:
+    """计算所有SKU维度的组合总数。"""
+    total = 1
+    for dim in sku_dimensions:
+        total *= len(dim.options)
+    return total
+
+
+def _print_dimensions_summary(sku_dimensions: List[SkuDimension]) -> None:
+    """打印维度与选项数量的概要信息。"""
+    total_combinations = _compute_total_combinations(sku_dimensions)
+    print(f"[信息] 检测到 {len(sku_dimensions)} 个维度，总共 {total_combinations} 个组合")
+    for i, dim in enumerate(sku_dimensions):
+        print(f"  维度{i+1}: {dim.name} ({len(dim.options)}个选项)")
+
+
+def _write_dimensions_structure_log(sku_dimensions: List[SkuDimension]) -> None:
+    """将所有维度及其选项结构输出到 log/sku维度选项结构.log（每次运行覆盖写入）。"""
+    log_dir = Path(__file__).with_name("log")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / "sku维度选项结构.log"
+    lines: List[str] = []
+    lines.append("# SKU维度与选项结构\n")
+    for i, dim in enumerate(sku_dimensions, 1):
+        lines.append(f"维度{i}: {dim.name}\n")
+        for j, opt in enumerate(dim.options, 1):
+            lines.append(f"  - 选项{j}: {opt.text} (vid={opt.vid})\n")
+        lines.append("\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+def _generate_all_combinations(sku_dimensions: List[SkuDimension]) -> List[Tuple[SkuOption, ...]]:
+    """生成所有SKU选项的笛卡尔积组合。"""
+    return list(itertools.product(*[d.options for d in sku_dimensions]))
+
+
+def _reorder_with_current_selected(
+    driver: webdriver.Edge,
+    sku_dimensions: List[SkuDimension],
+    combinations: List[Tuple[SkuOption, ...]],
+) -> Tuple[List[Tuple[SkuOption, ...]], List[str]]:
+    """将当前页面已选中的组合提前到第一个，并返回初始化的 last_selected_vids。"""
+    last_selected_vids: List[str] = []
+    try:
+        current_vids = _read_current_selected_vids(driver, len(sku_dimensions))
+        _log_debug(f"当前已选VID: {current_vids}")
+        if current_vids and len(current_vids) == len(sku_dimensions):
+            cur_opts: List[SkuOption] = []
+            for i, dim in enumerate(sku_dimensions):
+                vid = current_vids[i]
+                if not vid:
+                    cur_opts = []
+                    break
+                found = next((o for o in dim.options if o.vid == vid), None)
+                if not found:
+                    cur_opts = []
+                    break
+                cur_opts.append(found)
+            if cur_opts:
+                cur_tuple = tuple(cur_opts)
+                if cur_tuple in combinations:
+                    combinations = combinations[:]
+                    combinations.remove(cur_tuple)
+                    combinations.insert(0, cur_tuple)
+                    _log_debug("已将当前已选组合置于遍历首位")
+                    last_selected_vids = current_vids[:]
+    except Exception as e:
+        _log_debug(f"处理当前已选组合时异常: {e}")
+    return combinations, last_selected_vids
+
+
+def _apply_max_combos_limit(
+    combinations: List[Tuple[SkuOption, ...]]
+) -> List[Tuple[SkuOption, ...]]:
+    """根据环境变量 MAX_COMBOS 限制前 N 个组合用于快速自测。"""
+    try:
+        max_combos_str = os.environ.get("MAX_COMBOS", "").strip()
+        if max_combos_str:
+            max_combos = int(max_combos_str)
+            if max_combos > 0 and max_combos < len(combinations):
+                print(f"[信息] 仅执行前 {max_combos} 个组合用于快速验证（通过 MAX_COMBOS 控制）")
+                return combinations[:max_combos]
+    except Exception:
+        pass
+    return combinations
+
+
+def _handle_single_combination(
+    driver: webdriver.Edge,
+    sku_dimensions: List[SkuDimension],
+    combination: Tuple[SkuOption, ...],
+    last_selected_vids: List[str] | None,
+    t_after_parse: float,
+    combo_idx: int,
+    total_count: int,
+    first_select_logged: bool,
+) -> Tuple[List[str] | None, List[str], bool]:
+    """处理单个组合：点击、取价、日志记录。返回结果行（或None）与更新后的 last_selected_vids。"""
+    try:
+        print(f"\n[进度] 处理组合 {combo_idx}/{total_count}")
+        combo_text_parts = [f"{sku_dimensions[i].name}: {opt.text}" for i, opt in enumerate(combination)]
+        print(f"[组合] {' | '.join(combo_text_parts)}")
+
+        combo_info = "---".join([opt.text for opt in combination])
+
+        start_time = time.time()
+        t_click_begin = time.perf_counter()
+        last_selected_vids = _ensure_combination_selected(
+            driver, list(combination), last_selected_vids or None
+        )
+        t_click_end = time.perf_counter()
+        price = _get_price_text(driver)
+        t_price_end = time.perf_counter()
+        if not first_select_logged:
+            first_select_logged = True
+            _log_debug(
+                f"首次选中耗时：点击 {(t_click_end - t_click_begin)*1000:.0f}ms；取价 {(t_price_end - t_click_end)*1000:.0f}ms；自页面就绪起 {(t_click_end - t_after_parse):.3f}s"
+            )
+
+        price = _normalize_price_text(price)
+
+        result_row = [opt.text for opt in combination] + [price]
+        print(f"[成功] 价格: {price}")
+        elapsed_time = time.time() - start_time
+        print(f"[耗时] 本组合用时 {elapsed_time:.3f} 秒")
+
+        full_combo_info = f"{combo_info}---{price}"
+        _append_to_log(f"完成组合 {combo_idx}: {full_combo_info}")
+
+        time.sleep(random.uniform(0.02, 0.06))
+
+        return result_row, last_selected_vids, first_select_logged
+    except Exception as e:
+        print(f"[错误] 处理组合 {combo_idx} 失败: {e}")
+        return None, last_selected_vids or [], first_select_logged
+
+
+def _traverse_and_collect(
+    driver: webdriver.Edge,
+    sku_dimensions: List[SkuDimension],
+    combinations: List[Tuple[SkuOption, ...]],
+    last_selected_vids: List[str],
+    t_after_parse: float,
+) -> Tuple[List[List[str]], int]:
+    """遍历所有组合并汇总结果。返回结果表与成功计数。"""
+    results: List[List[str]] = []
+    success_count = 0
+    first_select_logged = False
+    for combo_idx, combination in enumerate(combinations, 1):
+        result_row, last_selected_vids, first_select_logged = _handle_single_combination(
+            driver,
+            sku_dimensions,
+            combination,
+            last_selected_vids,
+            t_after_parse,
+            combo_idx,
+            len(combinations),
+            first_select_logged,
+        )
+        if result_row is not None:
+            results.append(result_row)
+            success_count += 1
+    return results, success_count
+
 
 
 @task
@@ -560,113 +726,60 @@ def traverse_all_sku_combinations():
         sku_dimensions = _parse_sku_dimensions(driver)
         t_after_parse = time.perf_counter()
         _log_debug(f"阶段耗时：打开页面 {(t_after_open - t_after_init):.3f}s；解析SKU {(t_after_parse - t_after_open):.3f}s")
-        total_combinations = 1
-        for dim in sku_dimensions:
-            total_combinations *= len(dim.options)
 
-        print(f"[信息] 检测到 {len(sku_dimensions)} 个维度，总共 {total_combinations} 个组合")
-        for i, dim in enumerate(sku_dimensions):
-            print(f"  维度{i+1}: {dim.name} ({len(dim.options)}个选项)")
+        # 概要信息
+        _print_dimensions_summary(sku_dimensions)
+        # 输出维度与选项结构到日志文件
+        _write_dimensions_structure_log(sku_dimensions)
+
+        # 组合生成与预处理
+        combinations: List[Tuple[SkuOption, ...]] = _generate_all_combinations(sku_dimensions)
+        combinations, last_selected_vids = _reorder_with_current_selected(driver, sku_dimensions, combinations)
+        combinations = _apply_max_combos_limit(combinations)
 
         print("[步骤] 开始遍历所有SKU组合...")
-        combinations: List[Tuple[SkuOption, ...]] = list(itertools.product(*[d.options for d in sku_dimensions]))
-        # 将“当前页面已选中的组合”提前到第一个，尽可能避免首次点击的长停顿
-        try:
-            current_vids = _read_current_selected_vids(driver, len(sku_dimensions))
-            _log_debug(f"当前已选VID: {current_vids}")
-            if current_vids and len(current_vids) == len(sku_dimensions):
-                cur_opts: List[SkuOption] = []
-                for i, dim in enumerate(sku_dimensions):
-                    vid = current_vids[i]
-                    if not vid:
-                        cur_opts = []
-                        break
-                    found = next((o for o in dim.options if o.vid == vid), None)
-                    if not found:
-                        cur_opts = []
-                        break
-                    cur_opts.append(found)
-                if cur_opts:
-                    cur_tuple = tuple(cur_opts)
-                    if cur_tuple in combinations:
-                        combinations.remove(cur_tuple)
-                        combinations.insert(0, cur_tuple)
-                        _log_debug("已将当前已选组合置于遍历首位")
-                        # 初始化 last_selected_vids，避免对首组重复点击
-                        last_selected_vids = current_vids[:]  # type: ignore
-        except Exception as e:
-            _log_debug(f"处理当前已选组合时异常: {e}")
-        # 支持通过环境变量限制前 N 个组合用于快速自测
-        try:
-            max_combos_str = os.environ.get("MAX_COMBOS", "").strip()
-            if max_combos_str:
-                max_combos = int(max_combos_str)
-                if max_combos > 0 and max_combos < len(combinations):
-                    print(f"[信息] 仅执行前 {max_combos} 个组合用于快速验证（通过 MAX_COMBOS 控制）")
-                    combinations = combinations[:max_combos]
-        except Exception:
-            pass
 
-        results: List[List[str]] = []
-        success_count = 0
-        # 如果上面未通过“当前已选组合”初始化，则为空
-        try:
-            last_selected_vids  # type: ignore
-        except NameError:
-            last_selected_vids = []
-
-        first_select_logged = False
-        for combo_idx, combination in enumerate(combinations, 1):
-            try:
-                print(f"\n[进度] 处理组合 {combo_idx}/{len(combinations)}")
-                combo_text_parts = [f"{sku_dimensions[i].name}: {opt.text}" for i, opt in enumerate(combination)]
-                print(f"[组合] {' | '.join(combo_text_parts)}")
-
-                # 组合信息（通用拼接，不假定维度数量）
-                combo_info = "---".join([opt.text for opt in combination])
-
-                # 点击并校验
-                start_time = time.time()
-                t_click_begin = time.perf_counter()
-                last_selected_vids = _ensure_combination_selected(
-                    driver, list(combination), last_selected_vids or None
-                )
-                t_click_end = time.perf_counter()
-                price = _get_price_text(driver)
-                t_price_end = time.perf_counter()
-                if not first_select_logged:
-                    first_select_logged = True
-                    _log_debug(
-                        f"首次选中耗时：点击 {(t_click_end - t_click_begin)*1000:.0f}ms；取价 {(t_price_end - t_click_end)*1000:.0f}ms；自页面就绪起 {(t_click_end - t_after_parse):.3f}s"
-                    )
-                # 再保险：统一控制台友好的货币符号
-                price = _normalize_price_text(price)
-
-                # 保存结果
-                result_row = [opt.text for opt in combination] + [price]
-                results.append(result_row)
-                success_count += 1
-                print(f"[成功] 价格: {price}")
-                elapsed_time = time.time() - start_time
-                print(f"[耗时] 本组合用时 {elapsed_time:.3f} 秒")
-
-                full_combo_info = f"{combo_info}---{price}"
-                _append_to_log(f"完成组合 {combo_idx}: {full_combo_info}")
-
-                # 极短抖动，降低行为过于机械的特征，同时尽量不影响速度
-                time.sleep(random.uniform(0.02, 0.06))
-
-            except Exception as e:
-                print(f"[错误] 处理组合 {combo_idx} 失败: {e}")
-                continue
+        # 遍历并收集
+        results, success_count = _traverse_and_collect(
+            driver=driver,
+            sku_dimensions=sku_dimensions,
+            combinations=combinations,
+            last_selected_vids=last_selected_vids if 'last_selected_vids' in locals() else [],
+            t_after_parse=t_after_parse,
+        )
 
         print(f"\n[步骤] 遍历完成！成功处理 {success_count}/{len(combinations)} 个组合")
+
+        # 导出结果到 Excel（包含表头）
+        headers = [dim.name for dim in sku_dimensions] + ["价格"]
+        output_dir = Path(__file__).with_name("output")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        excel_path = output_dir / "result.xlsx"
+        try:
+            _export_results_to_excel(results, headers, excel_path)
+            print(f"[步骤] 已导出结果到: {excel_path}")
+        except Exception as e:
+            print(f"[错误] 导出Excel失败: {e}")
 
     finally:
         try:
             driver.quit()
         except Exception:
             pass
+
+
+def _export_results_to_excel(results: List[List[str]], headers: List[str], file_path: Path) -> None:
+    """使用 openpyxl 将结果写入 Excel（含表头），文件路径由调用方提供。"""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "结果"
+    # 表头
+    ws.append(headers)
+    # 数据行
+    for row in results:
+        ws.append(row)
+    # 保存
+    wb.save(str(file_path))
 
 
 
