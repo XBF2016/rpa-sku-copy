@@ -4,6 +4,10 @@ import time
 import os
 import shutil
 from pathlib import Path
+from dataclasses import dataclass
+from typing import List, Tuple
+import random
+import itertools
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -11,6 +15,37 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.edge.service import Service as EdgeService
 
+
+# 统一的页面元素选择器常量，便于维护与复用
+SKU_ITEM_SELECTOR = ".skuItem--Z2AJB9Ew"
+SKU_OPTION_SELECTOR = ".valueItem--smR4pNt4"
+DIM_LABEL_SELECTOR = ".ItemLabel--psS1SOyC span.f-els-2"
+OPTION_TEXT_SELECTOR = "span.f-els-1"
+
+# 价格相关选择器
+PRICE_MAIN_TEXT = ".highlightPrice--asfw5V1e .text--jyiUrkMu"
+PRICE_SYMBOL = ".highlightPrice--asfw5V1e .symbol--ZqZXkLDL"
+ORIG_PRICE_TEXTS = ".subPrice--empS5uv8 .text--jyiUrkMu"
+PRICE_ALT_SELECTORS = [
+    ".beltPrice--i5j_t2w4 .text--jyiUrkMu",
+    ".price--yeTcvSlD .number--ZQ6CbUNc",
+    ".tm-price-current",
+    "[class*='price'] [class*='number']",
+    "[class*='highlightPrice'] [class*='text']",
+]
+
+
+# 数据模型：更通用、更可读
+@dataclass(frozen=True)
+class SkuOption:
+    vid: str
+    text: str
+
+
+@dataclass
+class SkuDimension:
+    name: str
+    options: List[SkuOption]
 
 def _read_browser_path() -> str:
     """从 browser.txt 读取 Edge 可执行文件路径；若为空则回退为 'msedge.exe'。"""
@@ -142,6 +177,202 @@ def _read_product_url() -> str:
 
 
 
+def _prepare_clean_edge_state() -> None:
+    """准备干净的 Edge 运行环境，确保不受残留进程影响。"""
+    print("[步骤] 检查并关闭现有的 Edge 进程...")
+    if _is_process_running("msedge.exe"):
+        print("[信息] 检测到 Edge 正在运行，关闭所有 Edge 相关进程...")
+        _kill_edge_processes()
+        time.sleep(2)
+    print("[步骤] 关闭可能残留的 EdgeDriver 进程...")
+    _kill_driver_processes()
+
+
+def _init_edge_driver() -> webdriver.Edge:
+    """初始化 Edge WebDriver（使用本地 driver 与用户登录态）。"""
+    user_data_dir = os.path.expanduser("~\\AppData\\Local\\Microsoft\\Edge\\User Data")
+
+    print("[步骤] 初始化 Edge WebDriver（使用用户登录态）...")
+    options = EdgeOptions()
+    options.add_argument("--start-maximized")
+    options.add_argument(f"--user-data-dir={user_data_dir}")
+    options.add_argument("--profile-directory=Default")
+    # 防检测设置
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])  # 排除日志开关
+    options.add_experimental_option('useAutomationExtension', False)
+    # 降低浏览器日志级别，仅保留致命错误；并关闭日志输出、禁用QUIC，忽略证书错误
+    options.add_argument("--log-level=3")
+    options.add_argument("--disable-logging")
+    options.add_argument("--disable-quic")
+    options.add_argument("--ignore-certificate-errors")
+    options.set_capability("acceptInsecureCerts", True)
+
+    driver_path = _find_msedgedriver_path()
+    if not driver_path:
+        print("[错误] 未找到 msedgedriver.exe")
+        raise RuntimeError("未找到本地 EdgeDriver")
+
+    print(f"[信息] 使用本地 EdgeDriver: {driver_path}")
+    try:
+        service = EdgeService(executable_path=driver_path, log_output=subprocess.DEVNULL)
+    except TypeError:
+        service = EdgeService(executable_path=driver_path)
+
+    driver = webdriver.Edge(service=service, options=options)
+    driver.implicitly_wait(1)
+    # 移除 webdriver 痕迹
+    try:
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    except Exception:
+        pass
+    return driver
+
+
+def _open_product_page(driver: webdriver.Edge, url: str, wait_timeout: int = 30) -> None:
+    """打开商品页并等待 SKU 区域出现。"""
+    print("[步骤] 打开商品页面...")
+    driver.get(url)
+    # 页面打开后做一个短随机等待（防检测/渲染稳定）
+    time.sleep(random.uniform(3, 5))
+    WebDriverWait(driver, wait_timeout).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, SKU_ITEM_SELECTOR))
+    )
+
+
+def _parse_sku_dimensions(driver: webdriver.Edge) -> List[SkuDimension]:
+    """解析页面上的所有 SKU 维度与选项。"""
+    print("[步骤] 解析SKU维度和选项...")
+    sku_dimensions: List[SkuDimension] = []
+    sku_items = driver.find_elements(By.CSS_SELECTOR, SKU_ITEM_SELECTOR)
+
+    for idx, item in enumerate(sku_items, start=1):
+        # 维度名
+        try:
+            dim_label = item.find_element(By.CSS_SELECTOR, DIM_LABEL_SELECTOR)
+            dim_name = dim_label.get_attribute("title") or dim_label.text or f"维度{idx}"
+        except Exception:
+            dim_name = f"维度{idx}"
+
+        # 选项集合
+        options: List[SkuOption] = []
+        option_elements = item.find_elements(By.CSS_SELECTOR, SKU_OPTION_SELECTOR)
+        for opt_elem in option_elements:
+            try:
+                # 跳过不可用
+                if (opt_elem.get_attribute("data-disabled") or "").lower() == "true":
+                    continue
+                data_vid = opt_elem.get_attribute("data-vid")
+                span = opt_elem.find_element(By.CSS_SELECTOR, OPTION_TEXT_SELECTOR)
+                option_text = (span.get_attribute("title") or span.text or "").strip()
+                if data_vid and option_text:
+                    options.append(SkuOption(vid=data_vid, text=option_text))
+            except Exception:
+                continue
+
+        if options:
+            sku_dimensions.append(SkuDimension(name=dim_name.strip(), options=options))
+
+    return sku_dimensions
+
+
+def _is_selected_element(elem) -> bool:
+    """判断一个选项元素是否处于选中状态。"""
+    try:
+        cls = (elem.get_attribute("class") or "")
+        if ("selected" in cls) or ("Selected" in cls) or ("active" in cls) or ("checked" in cls):
+            return True
+        if (elem.get_attribute("aria-checked") or "").lower() == "true":
+            return True
+        if (elem.get_attribute("data-selected") or "").lower() == "true":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _ensure_combination_selected(driver: webdriver.Edge, combination: List[SkuOption]) -> None:
+    """按顺序点击组合中的每个 SKU 选项，并再次校验是否被反选，必要时补点。"""
+    # 首轮点击
+    for dim_idx, option in enumerate(combination):
+        try:
+            sku_items = driver.find_elements(By.CSS_SELECTOR, SKU_ITEM_SELECTOR)
+            current_dim = sku_items[dim_idx]
+            option_selector = f'{SKU_OPTION_SELECTOR}[data-vid="{option.vid}"]'
+            option_element = current_dim.find_element(By.CSS_SELECTOR, option_selector)
+            if not _is_selected_element(option_element):
+                driver.execute_script("arguments[0].click();", option_element)
+                time.sleep(0.1)
+        except Exception as e:
+            print(f"[警告] 点击维度{dim_idx+1}选项失败: {e}")
+            continue
+
+    # 二次校验并补点
+    try:
+        for dim_idx, option in enumerate(combination):
+            sku_items = driver.find_elements(By.CSS_SELECTOR, SKU_ITEM_SELECTOR)
+            current_dim = sku_items[dim_idx]
+            option_selector = f'{SKU_OPTION_SELECTOR}[data-vid="{option.vid}"]'
+            option_element = current_dim.find_element(By.CSS_SELECTOR, option_selector)
+            if not _is_selected_element(option_element):
+                driver.execute_script("arguments[0].click();", option_element)
+                time.sleep(0.08)
+    except Exception:
+        pass
+
+
+def _get_price_text(driver: webdriver.Edge) -> str:
+    """获取当前所选组合的价格文本（尽量快速、稳健）。"""
+    price = "未获取到价格"
+    try:
+        # 暂时降低隐式等待，加快价格检索
+        driver.implicitly_wait(0.5)
+
+        # 方案1：主价格与符号
+        try:
+            discount_price_elem = driver.find_element(By.CSS_SELECTOR, PRICE_MAIN_TEXT)
+            discount_price = discount_price_elem.text.strip()
+            symbol = driver.find_element(By.CSS_SELECTOR, PRICE_SYMBOL).text.strip()
+            if discount_price:
+                price = f"{symbol}{discount_price}"
+                return price
+        except Exception:
+            pass
+
+        # 方案2：备用选择器
+        for selector in PRICE_ALT_SELECTORS:
+            try:
+                price_element = driver.find_element(By.CSS_SELECTOR, selector)
+                price_text = price_element.text.strip()
+                if price_text:
+                    if ('¥' in price_text) or ('￥' in price_text):
+                        price = price_text
+                    else:
+                        price = f"¥{price_text}"
+                    return price
+            except Exception:
+                continue
+
+        # 方案3：通用 XPath
+        try:
+            price_elements = driver.find_elements(By.XPATH, "//*[contains(text(), '¥') or contains(text(), '￥')]")
+            for elem in price_elements[:3]:
+                text = (elem.text or "").strip()
+                if text and any(ch.isdigit() for ch in text) and len(text) < 20:
+                    price = text
+                    return price
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[警告] 获取价格失败: {e}")
+    finally:
+        # 恢复隐式等待
+        try:
+            driver.implicitly_wait(1)
+        except Exception:
+            pass
+    return price
+
 
 
 @task
@@ -151,320 +382,71 @@ def traverse_all_sku_combinations():
     使用防检测机制：随机延迟、模拟人类行为、控制点击速度。
     总共需要遍历 16×4×6=384个组合。
     """
-    import random
-    import itertools
-    from selenium.webdriver.common.action_chains import ActionChains
-    
     url = _read_product_url()
     print(f"[步骤] 读取到商品链接: {url}")
 
-    # 关闭现有Edge与EdgeDriver进程
-    print("[步骤] 检查并关闭现有的 Edge 进程...")
-    if _is_process_running("msedge.exe"):
-        print("[信息] 检测到 Edge 正在运行，关闭所有 Edge 相关进程...")
-        _kill_edge_processes()
-        time.sleep(2)
-    print("[步骤] 关闭可能残留的 EdgeDriver 进程...")
-    _kill_driver_processes()
+    # 准备浏览器环境并初始化驱动
+    _prepare_clean_edge_state()
+    driver = _init_edge_driver()
 
-    # 获取用户数据目录以保持登录态
-    user_data_dir = os.path.expanduser("~\\AppData\\Local\\Microsoft\\Edge\\User Data")
-    
-    print("[步骤] 初始化 Edge WebDriver（使用用户登录态）...")
-    options = EdgeOptions()
-    options.add_argument("--start-maximized")
-    options.add_argument(f"--user-data-dir={user_data_dir}")
-    options.add_argument("--profile-directory=Default")
-    # 防检测设置
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])  # 排除日志开关，减少控制台输出
-    options.add_experimental_option('useAutomationExtension', False)
-    # 降低浏览器日志级别，仅保留致命错误；并关闭日志输出、禁用QUIC，忽略证书错误（便于自动化环境）
-    options.add_argument("--log-level=3")
-    options.add_argument("--disable-logging")
-    options.add_argument("--disable-quic")
-    options.add_argument("--ignore-certificate-errors")
-    options.set_capability("acceptInsecureCerts", True)
-    
-    driver_path = _find_msedgedriver_path()
-    if not driver_path:
-        print("[错误] 未找到 msedgedriver.exe")
-        raise RuntimeError("未找到本地 EdgeDriver")
+    try:
+        # 打开页面并等待初始加载
+        _open_product_page(driver, url, wait_timeout=30)
 
-    print(f"[信息] 使用本地 EdgeDriver: {driver_path}")
-    # 将 EdgeDriver 的日志输出重定向到空设备，避免把浏览器/驱动内部日志打印到 Python 控制台
-    try:
-        service = EdgeService(executable_path=driver_path, log_output=subprocess.DEVNULL)
-    except TypeError:
-        # 兼容旧版 selenium 不支持 log_output 参数的情况
-        service = EdgeService(executable_path=driver_path)
-    driver = webdriver.Edge(service=service, options=options)
-    
-    # 设置较短的隐式等待和脚本执行器
-    driver.implicitly_wait(1)  # 从10秒减少到1秒
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    
-    try:
-        print("[步骤] 打开商品页面...")
-        driver.get(url)
-        time.sleep(random.uniform(3, 5))  # 随机等待页面加载
-        
-        wait = WebDriverWait(driver, 30)
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".skuItem--Z2AJB9Ew")))
-        
-        # 解析所有维度和选项
-        print("[步骤] 解析SKU维度和选项...")
-        sku_dimensions = []
-        sku_items = driver.find_elements(By.CSS_SELECTOR, ".skuItem--Z2AJB9Ew")
-        
-        for idx, item in enumerate(sku_items, start=1):
-            # 获取维度名称
-            try:
-                dim_label = item.find_element(By.CSS_SELECTOR, ".ItemLabel--psS1SOyC span.f-els-2")
-                dim_name = dim_label.get_attribute("title") or dim_label.text or f"维度{idx}"
-            except Exception:
-                dim_name = f"维度{idx}"
-            
-            # 获取该维度下的所有选项
-            options = []
-            option_elements = item.find_elements(By.CSS_SELECTOR, ".valueItem--smR4pNt4")
-            
-            for opt_elem in option_elements:
-                try:
-                    # 检查选项是否可用
-                    if opt_elem.get_attribute("data-disabled") == "true":
-                        continue
-                        
-                    data_vid = opt_elem.get_attribute("data-vid")
-                    span = opt_elem.find_element(By.CSS_SELECTOR, "span.f-els-1")
-                    option_text = span.get_attribute("title") or span.text or ""
-                    
-                    if data_vid and option_text:
-                        options.append({
-                            "vid": data_vid,
-                            "text": option_text.strip(),
-                            "element": opt_elem
-                        })
-                except Exception:
-                    continue
-            
-            if options:
-                sku_dimensions.append({
-                    "name": dim_name.strip(),
-                    "options": options
-                })
-        
+        # 解析维度
+        sku_dimensions = _parse_sku_dimensions(driver)
         total_combinations = 1
         for dim in sku_dimensions:
-            total_combinations *= len(dim["options"])
-        
+            total_combinations *= len(dim.options)
+
         print(f"[信息] 检测到 {len(sku_dimensions)} 个维度，总共 {total_combinations} 个组合")
         for i, dim in enumerate(sku_dimensions):
-            print(f"  维度{i+1}: {dim['name']} ({len(dim['options'])}个选项)")
-        
-        # 生成所有可能的组合
+            print(f"  维度{i+1}: {dim.name} ({len(dim.options)}个选项)")
+
         print("[步骤] 开始遍历所有SKU组合...")
-        combinations = list(itertools.product(*[dim["options"] for dim in sku_dimensions]))
-        
-        results = []
+        combinations: List[Tuple[SkuOption, ...]] = list(itertools.product(*[d.options for d in sku_dimensions]))
+
+        results: List[List[str]] = []
         success_count = 0
-        
+
         for combo_idx, combination in enumerate(combinations, 1):
             try:
                 print(f"\n[进度] 处理组合 {combo_idx}/{len(combinations)}")
-                
-                # 构建组合描述
-                combo_text = []
-                for i, option in enumerate(combination):
-                    combo_text.append(f"{sku_dimensions[i]['name']}: {option['text']}")
-                print(f"[组合] {' | '.join(combo_text)}")
-                
-                # 记录组合信息到log文件
-                combo_info = f"{combination[0]['text']}---{combination[1]['text']}---{combination[2]['text']}"
-                # _append_to_log(f"正在处理组合 {combo_idx}/{len(combinations)}: {combo_info}")
-                
-                # 依次点击每个维度的选项
-                start_time = time.time()
-                for dim_idx, option in enumerate(combination):
-                    try:
-                        # 重新找到元素（防止DOM更新导致的stale element问题）
-                        sku_items = driver.find_elements(By.CSS_SELECTOR, ".skuItem--Z2AJB9Ew")
-                        current_dim = sku_items[dim_idx]
-                        
-                        # 找到对应的选项元素
-                        option_selector = f'.valueItem--smR4pNt4[data-vid="{option["vid"]}"]'
-                        option_element = current_dim.find_element(By.CSS_SELECTOR, option_selector)
-                        
-                        # 如果已选中则跳过点击，避免重复点击导致反选
-                        is_selected = False
-                        try:
-                            cls = (option_element.get_attribute("class") or "")
-                            if ("selected" in cls) or ("Selected" in cls) or ("active" in cls) or ("checked" in cls):
-                                is_selected = True
-                            if (option_element.get_attribute("aria-checked") or "").lower() == "true":
-                                is_selected = True
-                            if (option_element.get_attribute("data-selected") or "").lower() == "true":
-                                is_selected = True
-                        except Exception:
-                            pass
-                        
-                        if not is_selected:
-                            driver.execute_script("arguments[0].click();", option_element)
-                            time.sleep(0.1)  # 很短的延迟
-                        else:
-                            # 已经是期望的选中状态，无需再次点击
-                            pass
-                        
-                    except Exception as e:
-                        print(f"[警告] 点击维度{dim_idx+1}选项失败: {e}")
-                        continue
-                
-                # 再次校验：若后续点击导致前面维度被反选，则补点恢复
-                try:
-                    for dim_idx, option in enumerate(combination):
-                        sku_items = driver.find_elements(By.CSS_SELECTOR, ".skuItem--Z2AJB9Ew")
-                        current_dim = sku_items[dim_idx]
-                        option_selector = f'.valueItem--smR4pNt4[data-vid="{option["vid"]}"]'
-                        option_element = current_dim.find_element(By.CSS_SELECTOR, option_selector)
+                combo_text_parts = [f"{sku_dimensions[i].name}: {opt.text}" for i, opt in enumerate(combination)]
+                print(f"[组合] {' | '.join(combo_text_parts)}")
 
-                        cls = (option_element.get_attribute("class") or "")
-                        attr_aria = (option_element.get_attribute("aria-checked") or "").lower()
-                        attr_data = (option_element.get_attribute("data-selected") or "").lower()
-                        still_selected = (
-                            ("selected" in cls) or ("Selected" in cls) or ("active" in cls) or ("checked" in cls)
-                            or attr_aria == "true" or attr_data == "true"
-                        )
-                        if not still_selected:
-                            driver.execute_script("arguments[0].click();", option_element)
-                            time.sleep(0.08)
-                except Exception:
-                    pass
-                
-                # 等待价格更新（较短时间）
+                # 组合信息（通用拼接，不假定维度数量）
+                combo_info = "---".join([opt.text for opt in combination])
+
+                # 点击并校验
+                start_time = time.time()
+                _ensure_combination_selected(driver, list(combination))
+
+                # 略等价格刷新
                 time.sleep(0.3)
-                
-                # 快速获取价格信息（基于实际页面结构优化）
-                price = "未获取到价格"
-                discount_price = ""  # 券后价格
-                original_price = ""  # 优惠前价格
-                
-                try:
-                    # 临时设置更短的隐式等待
-                    driver.implicitly_wait(0.5)
-                    
-                    # 方案1：基于实际页面结构的精确选择器
-                    try:
-                        # 获取券后价格（主价格）
-                        discount_price_elem = driver.find_element(By.CSS_SELECTOR, ".highlightPrice--asfw5V1e .text--jyiUrkMu")
-                        discount_price = discount_price_elem.text.strip()
-                        
-                        # 获取价格符号
-                        symbol_elem = driver.find_element(By.CSS_SELECTOR, ".highlightPrice--asfw5V1e .symbol--ZqZXkLDL")
-                        symbol = symbol_elem.text.strip()
-                        
-                        if discount_price:
-                            price = f"{symbol}{discount_price}"
-                            print(f"[价格信息] 券后价格: {price}")
-                            
-                            # 尝试获取优惠前价格
-                            try:
-                                original_price_elems = driver.find_elements(By.CSS_SELECTOR, ".subPrice--empS5uv8 .text--jyiUrkMu")
-                                if len(original_price_elems) >= 2:  # 第一个是"¥"符号，第二个是价格
-                                    original_price = original_price_elems[1].text.strip()
-                                    if original_price:
-                                        print(f"[价格信息] 优惠前价格: ¥{original_price}")
-                            except Exception:
-                                pass
-                    except Exception:
-                        # 方案2：备用的价格获取方案
-                        price_selectors = [
-                            ".beltPrice--i5j_t2w4 .text--jyiUrkMu",  # 价格区域的通用文本
-                            ".price--yeTcvSlD .number--ZQ6CbUNc",    # 原有的淘宝通用选择器
-                            ".tm-price-current",                     # 天猫价格选择器
-                            "[class*='price'] [class*='number']",    # 通用价格数字选择器
-                            "[class*='highlightPrice'] [class*='text']"  # 高亮价格文本
-                        ]
-                        
-                        for selector in price_selectors:
-                            try:
-                                price_element = driver.find_element(By.CSS_SELECTOR, selector)
-                                price_text = price_element.text.strip()
-                                if price_text and price_text != "":
-                                    # 如果没有货币符号，添加¥符号
-                                    if not ('¥' in price_text or '￥' in price_text):
-                                        price = f"¥{price_text}"
-                                    else:
-                                        price = price_text
-                                    print(f"[价格信息] 获取到价格: {price}")
-                                    break
-                            except Exception:
-                                continue
-                    
-                    # 方案3：如果还没找到，使用XPath通用方法
-                    if price == "未获取到价格":
-                        try:
-                            # 查找包含价格符号的元素
-                            price_elements = driver.find_elements(By.XPATH, 
-                                "//*[contains(text(), '¥') or contains(text(), '￥')]")
-                            for elem in price_elements[:3]:  # 检查前3个
-                                text = elem.text.strip()
-                                # 检查是否为有效价格格式（包含货币符号且长度合理）
-                                if (text and ('¥' in text or '￥' in text) and 
-                                    len(text) < 20 and 
-                                    any(char.isdigit() for char in text)):
-                                    price = text
-                                    print(f"[价格信息] 通用方法获取价格: {price}")
-                                    break
-                        except Exception:
-                            pass
-                    
-                    # 恢复隐式等待
-                    driver.implicitly_wait(1)
-                
-                except Exception as e:
-                    print(f"[警告] 获取价格失败: {e}")
-                    # 恢复隐式等待
-                    driver.implicitly_wait(1)
-                
+                price = _get_price_text(driver)
+
                 # 保存结果
-                result_row = []
-                for option in combination:
-                    result_row.append(option['text'])
-                result_row.append(price)
+                result_row = [opt.text for opt in combination] + [price]
                 results.append(result_row)
-                
                 success_count += 1
                 print(f"[成功] 价格: {price}")
-                
-                # 记录成功结果到log文件
+
                 full_combo_info = f"{combo_info}---{price}"
                 _append_to_log(f"完成组合 {combo_idx}: {full_combo_info}")
-                
-                # 控制每个组合处理时间约1秒（减少不必要延迟）
+
+                # 控制单次处理时长约 1 秒
                 elapsed_time = time.time() - start_time
-                if elapsed_time < 1:  # 从1秒减少到0.8秒，更快的处理速度
+                if elapsed_time < 1:
                     time.sleep(1 - elapsed_time)
-                
-                # # 每处理一定数量的组合就保存一次结果
-                # if combo_idx % 50 == 0:
-                #     _append_to_log(f"中间保存: 已处理 {combo_idx} 个组合")
-                #     print(f"[信息] 已处理 {combo_idx} 个组合，中间保存完成")
-                
-                # # 防检测：每50个组合休息一下（减少频率）
-                # if combo_idx % 50 == 0:
-                #     delay = random.uniform(1, 2)
-                #     _append_to_log(f"防检测休息 {delay:.1f} 秒...")
-                #     print(f"[防检测] 休息 {delay:.1f} 秒...")
-                #     time.sleep(delay)
-                
+
             except Exception as e:
                 print(f"[错误] 处理组合 {combo_idx} 失败: {e}")
                 continue
-        
-        # 保存最终结果
+
         print(f"\n[步骤] 遍历完成！成功处理 {success_count}/{len(combinations)} 个组合")
         print("[完成] 所有SKU组合遍历完成，结果已保存到 sku维度及选项.md")
-        
+
     finally:
         try:
             driver.quit()

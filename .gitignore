@@ -146,7 +146,9 @@ cython_debug/
 
 # 日志
 *.log
-log
+log/
+
+output/
 
 
 

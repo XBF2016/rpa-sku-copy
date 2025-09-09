@@ -1,10 +1,6 @@
 tasks:
-  Open Edge Logged In:
-    shell: python -m robocorp.tasks run tasks.py -t open_edge_logged_in
-  Open Product Page:
-    shell: python -m robocorp.tasks run tasks.py -t open_product_page
-  Extract SKU Dimensions:
-    shell: python -m robocorp.tasks run tasks.py -t extract_sku_dimensions
+  Traverse All SKU Combinations:
+    shell: python -m robocorp.tasks run tasks.py -t traverse_all_sku_combinations
 
 condaConfigFile: conda.yaml
 artifactsDir: output
