@@ -159,18 +159,30 @@ def _find_msedgedriver_path() -> str | None:
 
 
 def _read_product_url() -> str:
-    """从 product-url.txt 读取商品链接（取第一条非空行）。"""
+    """从 product-url.txt 读取商品链接（取第一条有效行）。
+    规则：
+      - 忽略空行
+      - 忽略以 '#' 开头的注释行
+      - 取第一条以 http/https 开头的链接
+    """
     path_file = Path(__file__).with_name("product-url.txt")
     if not path_file.exists():
         raise ValueError("未找到 product-url.txt，请在项目根目录提供该文件")
-    # 读取第一条非空行
+    # 顺序读取，跳过空行与以 # 开头的注释行，返回第一条有效链接
     for line in path_file.read_text(encoding="utf-8").splitlines():
         url = line.strip()
-        if url:
-            if url.startswith("http://") or url.startswith("https://"):
-                return url
-            raise ValueError("product-url.txt 中的第一条非空内容不是有效的 http/https 链接")
-    raise ValueError("product-url.txt 中没有可用的链接内容")
+        # 跳过空行
+        if not url:
+            continue
+        # 跳过注释行（以 # 开头）
+        if url.startswith('#'):
+            continue
+        # 校验链接协议头
+        if url.startswith("http://") or url.startswith("https://"):
+            return url
+        # 如果遇到的第一条非空且非注释内容不是链接，则直接报错
+        raise ValueError("product-url.txt 中存在非注释的第一条内容不是有效的 http/https 链接")
+    raise ValueError("product-url.txt 中没有可用的链接内容（已忽略空行与注释行）")
 
 
 
