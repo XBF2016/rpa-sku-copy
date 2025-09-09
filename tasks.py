@@ -35,6 +35,17 @@ PRICE_ALT_SELECTORS = [
 ]
 
 
+# 控制台/日志文本规范化（解决 Windows 控制台 GBK 下 '¥' 无法编码的问题）
+def _normalize_price_text(txt: str) -> str:
+    try:
+        if not isinstance(txt, str):
+            txt = str(txt)
+    except Exception:
+        txt = ""
+    # 将 '¥'(U+00A5) 统一替换为 '￥'(U+FFE5)
+    return (txt or "").replace("¥", "￥").strip()
+
+
 # 数据模型：更通用、更可读
 @dataclass(frozen=True)
 class SkuOption:
@@ -246,7 +257,7 @@ def _open_product_page(driver: webdriver.Edge, url: str, wait_timeout: int = 30)
     print("[步骤] 打开商品页面...")
     driver.get(url)
     # 页面打开后做一个短随机等待（防检测/渲染稳定）
-    time.sleep(random.uniform(3, 5))
+    time.sleep(random.uniform(0.6, 1.2))
     WebDriverWait(driver, wait_timeout).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, SKU_ITEM_SELECTOR))
     )
@@ -303,10 +314,28 @@ def _is_selected_element(elem) -> bool:
     return False
 
 
-def _ensure_combination_selected(driver: webdriver.Edge, combination: List[SkuOption]) -> None:
-    """按顺序点击组合中的每个 SKU 选项，并再次校验是否被反选，必要时补点。"""
-    # 首轮点击
-    for dim_idx, option in enumerate(combination):
+def _ensure_combination_selected(
+    driver: webdriver.Edge,
+    combination: List[SkuOption],
+    last_selected_vids: List[str] | None = None,
+) -> List[str]:
+    """按需点击组合中的 SKU 选项：仅对发生变化的维度执行点击；随后做一次快速校验，必要时补点。
+    返回本次目标组合的 vid 列表，供下次迭代复用，减少无效点击。
+    """
+    # 计算需要变更的维度索引集合
+    need_change_indices = list(range(len(combination)))
+    if last_selected_vids and len(last_selected_vids) == len(combination):
+        need_change_indices = [
+            i for i, opt in enumerate(combination) if last_selected_vids[i] != opt.vid
+        ]
+
+    # 如果没有变化，直接返回
+    if not need_change_indices:
+        return [opt.vid for opt in combination]
+
+    # 首轮：只点击有变化的维度
+    for dim_idx in need_change_indices:
+        option = combination[dim_idx]
         try:
             sku_items = driver.find_elements(By.CSS_SELECTOR, SKU_ITEM_SELECTOR)
             current_dim = sku_items[dim_idx]
@@ -314,76 +343,79 @@ def _ensure_combination_selected(driver: webdriver.Edge, combination: List[SkuOp
             option_element = current_dim.find_element(By.CSS_SELECTOR, option_selector)
             if not _is_selected_element(option_element):
                 driver.execute_script("arguments[0].click();", option_element)
-                time.sleep(0.1)
+                # 极短抖动，给页面联动微时间
+                time.sleep(0.03)
         except Exception as e:
             print(f"[警告] 点击维度{dim_idx+1}选项失败: {e}")
             continue
 
-    # 二次校验并补点
+    # 二次：对全部维度做一次快速校验与补点，避免上层维度变化导致下层被反选
     try:
+        sku_items = driver.find_elements(By.CSS_SELECTOR, SKU_ITEM_SELECTOR)
         for dim_idx, option in enumerate(combination):
-            sku_items = driver.find_elements(By.CSS_SELECTOR, SKU_ITEM_SELECTOR)
             current_dim = sku_items[dim_idx]
             option_selector = f'{SKU_OPTION_SELECTOR}[data-vid="{option.vid}"]'
             option_element = current_dim.find_element(By.CSS_SELECTOR, option_selector)
             if not _is_selected_element(option_element):
                 driver.execute_script("arguments[0].click();", option_element)
-                time.sleep(0.08)
+                time.sleep(0.03)
     except Exception:
         pass
 
+    return [opt.vid for opt in combination]
+
 
 def _get_price_text(driver: webdriver.Edge) -> str:
-    """获取当前所选组合的价格文本（尽量快速、稳健）。"""
-    price = "未获取到价格"
-    try:
-        # 暂时降低隐式等待，加快价格检索
-        driver.implicitly_wait(0.5)
+    """获取当前所选组合的价格文本（JS一次性查询 + 短轮询，极限压缩等待时间）。"""
+    # 通过 execute_script 的参数传入备用选择器，避免引号转义问题
+    js = (
+        "return (function(alts){\n"
+        f"  var mainText = document.querySelector('{PRICE_MAIN_TEXT}');\n"
+        f"  var symbolEl = document.querySelector('{PRICE_SYMBOL}');\n"
+        "  if (mainText && mainText.textContent) {\n"
+        "    var sym = symbolEl && symbolEl.textContent ? symbolEl.textContent.trim() : '¥';\n"
+        "    var txt = mainText.textContent.trim();\n"
+        "    if (txt) return sym + txt;\n"
+        "  }\n"
+        "  alts = Array.isArray(alts) ? alts : [];\n"
+        "  for (var i=0; i<alts.length; i++){\n"
+        "    var el = document.querySelector(alts[i]);\n"
+        "    if (el && el.textContent){\n"
+        "      var t = el.textContent.trim();\n"
+        "      if (t){\n"
+        "        if (t.indexOf('¥') !== -1 || t.indexOf('￥') !== -1) return t;\n"
+        "        return '¥' + t;\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "  var belt = document.querySelector('.beltPrice--i5j_t2w4');\n"
+        "  if (belt){\n"
+        "    var nodes = belt.querySelectorAll(\".text--jyiUrkMu, .number--ZQ6CbUNc, [class*='number'], [class*='text']\");\n"
+        "    for (var j=0; j<nodes.length; j++){\n"
+        "      var tt = (nodes[j].textContent || '').trim();\n"
+        "      if (tt && /\\d/.test(tt)){\n"
+        "        if (tt.indexOf('¥') !== -1 || tt.indexOf('￥') !== -1) return tt;\n"
+        "        return '¥' + tt;\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "  return '';\n"
+        "})(arguments[0]);"
+    )
 
-        # 方案1：主价格与符号
+    # 最多短轮询 ~300ms，提高对价格异步刷新的兼容
+    end_time = time.perf_counter() + 0.3
+    last = ""
+    while time.perf_counter() < end_time:
         try:
-            discount_price_elem = driver.find_element(By.CSS_SELECTOR, PRICE_MAIN_TEXT)
-            discount_price = discount_price_elem.text.strip()
-            symbol = driver.find_element(By.CSS_SELECTOR, PRICE_SYMBOL).text.strip()
-            if discount_price:
-                price = f"{symbol}{discount_price}"
-                return price
+            price = (driver.execute_script(js, PRICE_ALT_SELECTORS) or "").strip()
+            if price and any(ch.isdigit() for ch in price):
+                return _normalize_price_text(price)
+            last = price
         except Exception:
             pass
-
-        # 方案2：备用选择器
-        for selector in PRICE_ALT_SELECTORS:
-            try:
-                price_element = driver.find_element(By.CSS_SELECTOR, selector)
-                price_text = price_element.text.strip()
-                if price_text:
-                    if ('¥' in price_text) or ('￥' in price_text):
-                        price = price_text
-                    else:
-                        price = f"¥{price_text}"
-                    return price
-            except Exception:
-                continue
-
-        # 方案3：通用 XPath
-        try:
-            price_elements = driver.find_elements(By.XPATH, "//*[contains(text(), '¥') or contains(text(), '￥')]")
-            for elem in price_elements[:3]:
-                text = (elem.text or "").strip()
-                if text and any(ch.isdigit() for ch in text) and len(text) < 20:
-                    price = text
-                    return price
-        except Exception:
-            pass
-    except Exception as e:
-        print(f"[警告] 获取价格失败: {e}")
-    finally:
-        # 恢复隐式等待
-        try:
-            driver.implicitly_wait(1)
-        except Exception:
-            pass
-    return price
+        time.sleep(0.06)
+    return _normalize_price_text(last) or "未获取到价格"
 
 
 
@@ -392,7 +424,6 @@ def traverse_all_sku_combinations():
     """
     自动遍历所有SKU维度组合，获取每个组合的价格信息，并写入markdown表格。
     使用防检测机制：随机延迟、模拟人类行为、控制点击速度。
-    总共需要遍历 16×4×6=384个组合。
     """
     url = _read_product_url()
     print(f"[步骤] 读取到商品链接: {url}")
@@ -417,9 +448,20 @@ def traverse_all_sku_combinations():
 
         print("[步骤] 开始遍历所有SKU组合...")
         combinations: List[Tuple[SkuOption, ...]] = list(itertools.product(*[d.options for d in sku_dimensions]))
+        # 支持通过环境变量限制前 N 个组合用于快速自测
+        try:
+            max_combos_str = os.environ.get("MAX_COMBOS", "").strip()
+            if max_combos_str:
+                max_combos = int(max_combos_str)
+                if max_combos > 0 and max_combos < len(combinations):
+                    print(f"[信息] 仅执行前 {max_combos} 个组合用于快速验证（通过 MAX_COMBOS 控制）")
+                    combinations = combinations[:max_combos]
+        except Exception:
+            pass
 
         results: List[List[str]] = []
         success_count = 0
+        last_selected_vids: List[str] = []
 
         for combo_idx, combination in enumerate(combinations, 1):
             try:
@@ -432,32 +474,32 @@ def traverse_all_sku_combinations():
 
                 # 点击并校验
                 start_time = time.time()
-                _ensure_combination_selected(driver, list(combination))
-
-                # 略等价格刷新
-                time.sleep(0.3)
+                last_selected_vids = _ensure_combination_selected(
+                    driver, list(combination), last_selected_vids or None
+                )
                 price = _get_price_text(driver)
+                # 再保险：统一控制台友好的货币符号
+                price = _normalize_price_text(price)
 
                 # 保存结果
                 result_row = [opt.text for opt in combination] + [price]
                 results.append(result_row)
                 success_count += 1
                 print(f"[成功] 价格: {price}")
+                elapsed_time = time.time() - start_time
+                print(f"[耗时] 本组合用时 {elapsed_time:.3f} 秒")
 
                 full_combo_info = f"{combo_info}---{price}"
                 _append_to_log(f"完成组合 {combo_idx}: {full_combo_info}")
 
-                # 控制单次处理时长约 1 秒
-                elapsed_time = time.time() - start_time
-                if elapsed_time < 1:
-                    time.sleep(1 - elapsed_time)
+                # 极短抖动，降低行为过于机械的特征，同时尽量不影响速度
+                time.sleep(random.uniform(0.02, 0.06))
 
             except Exception as e:
                 print(f"[错误] 处理组合 {combo_idx} 失败: {e}")
                 continue
 
         print(f"\n[步骤] 遍历完成！成功处理 {success_count}/{len(combinations)} 个组合")
-        print("[完成] 所有SKU组合遍历完成，结果已保存到 sku维度及选项.md")
 
     finally:
         try:
