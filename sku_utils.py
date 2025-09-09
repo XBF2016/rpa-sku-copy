@@ -25,6 +25,10 @@ PRICE_ALT_SELECTORS = [
     "[class*='highlightPrice'] [class*='text']",
 ]
 
+# 主图相关选择器（方案A）
+MAIN_PIC_IMG_SELECTOR = "img[class*='mainPic']"
+ZOOM_IMG_DIV_SELECTOR = ".js-image-zoom__zoomed-image"
+
 
 # 数据模型：更通用、更可读
 @dataclass(frozen=True)
@@ -207,6 +211,46 @@ def get_price_text(driver) -> str:
     price_final = normalize_price_text(last) or "未获取到价格"
     log_debug(f"取价耗时 {(time.perf_counter() - t_price0)*1000:.0f}ms，结果 {price_final}")
     return price_final
+
+
+def get_main_image_url(driver) -> str:
+    """获取当前主图的大图 URL（方案A）。
+    优先返回主图 <img> 的 src（保持原样，包含 .webp 等后缀）；若未找到，则回退到放大镜容器的背景图 URL。
+    """
+    js = (
+        "return (function(imgSel, zoomSel){\n"
+        "  function extractFromBg(bg){\n"
+        "    try{ if(!bg) return ''; }catch(e){ return ''; }\n"
+        "    var m = String(bg).match(/url\\([\"']?(.*?)[\"']?\\)/i);\n"
+        "    if (m && m[1]) return (m[1] || '').trim();\n"
+        "    return '';\n"
+        "  }\n"
+        "  // 1) 先取主图 <img> 的 src\n"
+        "  try{\n"
+        "    var img = document.querySelector(imgSel);\n"
+        "    if (img && img.src){ return (img.src || '').trim(); }\n"
+        "  }catch(e){}\n"
+        "  // 2) 兜底：放大镜容器背景图\n"
+        "  try{\n"
+        "    var zoom = document.querySelector(zoomSel);\n"
+        "    if (zoom){\n"
+        "      var cs = window.getComputedStyle ? window.getComputedStyle(zoom) : null;\n"
+        "      var bg = (zoom.style && zoom.style.backgroundImage) || (cs && cs.backgroundImage) || '';\n"
+        "      var hi = extractFromBg(bg);\n"
+        "      if (hi) return hi;\n"
+        "    }\n"
+        "  }catch(e){}\n"
+        "  return '';\n"
+        "})(arguments[0], arguments[1]);"
+    )
+
+    try:
+        url = (
+            driver.execute_script(js, MAIN_PIC_IMG_SELECTOR, ZOOM_IMG_DIV_SELECTOR) or ""
+        ).strip()
+        return url
+    except Exception:
+        return ""
 
 
 def compute_total_combinations(sku_dimensions: List[SkuDimension]) -> int:

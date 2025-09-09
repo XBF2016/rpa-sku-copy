@@ -11,6 +11,7 @@ from sku_utils import (
     SKU_ITEM_SELECTOR,
     SKU_OPTION_SELECTOR,
     get_price_text,
+    get_main_image_url,
     is_selected_element,
     read_current_selected_vids,
 )
@@ -138,6 +139,7 @@ def handle_single_combination(
         )
         t_click_end = time.perf_counter()
         price = get_price_text(driver)
+        image_url = get_main_image_url(driver)
         t_price_end = time.perf_counter()
         if not first_select_logged:
             first_select_logged = True
@@ -147,7 +149,8 @@ def handle_single_combination(
 
         price = normalize_price_text(price)
 
-        result_row = [opt.text for opt in combination] + [price]
+        # 结果行：各维度 + 图片(用于嵌入) + 图片链接(纯文本) + 价格
+        result_row = [opt.text for opt in combination] + [image_url, image_url, price]
         print(f"[成功] 价格: {price}")
         elapsed_time = time.time() - start_time
         print(f"[耗时] 本组合用时 {elapsed_time:.3f} 秒")

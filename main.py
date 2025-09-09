@@ -76,8 +76,8 @@ def traverse_all_sku_combinations():
 
         print(f"\n[步骤] 遍历完成！成功处理 {success_count}/{len(combinations)} 个组合")
 
-        # 导出结果到 Excel（包含表头）
-        headers = [dim.name for dim in sku_dimensions] + ["价格"]
+        # 导出结果到 Excel（包含表头）：各维度 + 图片 + 图片链接 + 价格
+        headers = [dim.name for dim in sku_dimensions] + ["图片", "图片链接", "价格"]
         output_dir = Path(__file__).resolve().parent / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
         excel_path = output_dir / "result.xlsx"
