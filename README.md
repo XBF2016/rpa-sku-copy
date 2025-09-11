@@ -27,6 +27,7 @@
   - `PATH: ['..']`，`PYTHONPATH: ['..']`
 - `conda.yaml`：Python 环境依赖（包含 robocorp-tasks、selenium、openpyxl 等）。
   - 现已增加 `pillow` 依赖，用于在 Excel 中嵌入图片。
+  - 依赖精简：移除 `webdriver-manager`（不再联网下载驱动），通过本地路径自动查找 `msedgedriver.exe`（见 `browser_utils.find_msedgedriver_path()`）。
 
 ## 浏览器驱动（driver/）
 - 将 `msedgedriver.exe` 放置到 `driver/` 目录（默认优先查找此处）。
@@ -59,3 +60,10 @@
     - 最终兜底：在全局尝试若干主图候选选择器，必要时使用 `meta[property='og:image']` / `link[rel=image_src]`；
     - 兼容以 `//` 开头的协议相对地址（自动补全为 `https:`）；
     - 在点击SKU后做短轮询等待（~0.8s）并尝试触发一次主图区域的悬停，以促使放大镜背景图预加载。
+
+### 导出文件存放路径
+- 结果文件将保存为：`output/[店铺名]商品名/result.xlsx`
+- “店铺名/商品名”的解析基于元素示例：
+  - 商品名：`元素示例/商品名.html`（选择器：`[class*='mainTitle--']`）
+  - 店铺名：`元素示例/店铺名.html`（选择器：`[class*='shopName--']`）
+- 文件夹名称会自动清理非法字符（例如 `\/:*?"<>|` 等），并做适当长度截断，确保在 Windows 下可用。

@@ -1,7 +1,6 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
 import time
-import random
 from pathlib import Path
 from selenium.webdriver.common.by import By
 
@@ -16,7 +15,6 @@ OPTION_TEXT_SELECTOR = "span.f-els-1"
 # 价格相关选择器（主选择器仍优先，配合兜底）
 PRICE_MAIN_TEXT = "[class*='highlightPrice'] [class*='text']"
 PRICE_SYMBOL = "[class*='highlightPrice'] [class*='symbol']"
-ORIG_PRICE_TEXTS = "[class*='subPrice'] [class*='text']"
 PRICE_ALT_SELECTORS = [
     "[class*='beltPrice'] [class*='text']",
     "[class*='priceWrap'] [class*='text']",
@@ -28,6 +26,11 @@ PRICE_ALT_SELECTORS = [
 # 主图相关选择器（方案A）
 MAIN_PIC_IMG_SELECTOR = "img[class*='mainPic']"
 ZOOM_IMG_DIV_SELECTOR = ".js-image-zoom__zoomed-image"
+
+# 商品名与店铺名选择器（基于 元素示例/商品名.html 与 元素示例/店铺名.html）
+# 使用包含匹配以兼容哈希后缀类名变化
+PRODUCT_NAME_SELECTOR = "[class*='mainTitle--']"
+SHOP_NAME_SELECTOR = "[class*='shopName--']"
 
 
 # 数据模型：更通用、更可读
@@ -386,6 +389,46 @@ def get_main_image_url(driver) -> str:
     except Exception:
         pass
     return last if (last.startswith("http://") or last.startswith("https://")) else ""
+
+
+def _get_text_by_selector(driver, selector: str) -> str:
+    """通用：获取单个元素的文本（优先 title，其次 textContent）。失败返回空串。"""
+    js = (
+        "return (function(sel){\n"
+        "  try{\n"
+        "    var el = document.querySelector(sel);\n"
+        "    if(!el) return '';\n"
+        "    var t = el.getAttribute('title') || el.textContent || '';\n"
+        "    return (t||'').trim();\n"
+        "  }catch(e){ return ''; }\n"
+        "})(arguments[0]);"
+    )
+    try:
+        txt = driver.execute_script(js, PRODUCT_NAME_SELECTOR if selector is None else selector) or ""
+    except Exception:
+        txt = ""
+    try:
+        return str(txt).strip()
+    except Exception:
+        return ""
+
+
+def get_product_name(driver) -> str:
+    """获取商品名（基于元素示例选择器）；若失败返回“未知商品”。"""
+    try:
+        txt = _get_text_by_selector(driver, PRODUCT_NAME_SELECTOR)
+        return txt or "未知商品"
+    except Exception:
+        return "未知商品"
+
+
+def get_shop_name(driver) -> str:
+    """获取店铺名（基于元素示例选择器）；若失败返回“未知店铺”。"""
+    try:
+        txt = _get_text_by_selector(driver, SHOP_NAME_SELECTOR)
+        return txt or "未知店铺"
+    except Exception:
+        return "未知店铺"
 
 
 def compute_total_combinations(sku_dimensions: List[SkuDimension]) -> int:

@@ -105,7 +105,6 @@ def prepare_clean_edge_state() -> None:
         print("[信息] 检测到 Edge 正在运行，关闭所有 Edge 相关进程...")
         t0 = time.perf_counter()
         kill_edge_processes()
-        t0 = time.perf_counter()
         while time.perf_counter() - t0 < 1.0:
             if not is_process_running("msedge.exe"):
                 break

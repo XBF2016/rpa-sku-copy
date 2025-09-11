@@ -1,10 +1,10 @@
 from robocorp.tasks import task
 import time
-import os
 from pathlib import Path
+import re
 
 # 模块化导入
-from common import read_product_url, log_debug, append_to_log
+from common import read_product_url, log_debug
 from browser_utils import (
     prepare_clean_edge_state,
     init_edge_driver,
@@ -15,8 +15,8 @@ from sku_utils import (
     parse_sku_dimensions,
     print_dimensions_summary,
     write_dimensions_structure_log,
-    SkuOption,
-    SkuDimension,
+    get_product_name,
+    get_shop_name,
 )
 from traversal import (
     generate_all_combinations,
@@ -54,6 +54,11 @@ def traverse_all_sku_combinations():
         t_after_parse = time.perf_counter()
         log_debug(f"阶段耗时：打开页面 {(t_after_open - t_after_init):.3f}s；解析SKU {(t_after_parse - t_after_open):.3f}s")
 
+        # 解析店铺名与商品名（用于导出目录名）
+        shop_name = get_shop_name(driver)
+        product_name = get_product_name(driver)
+        print(f"[信息] 店铺: {shop_name} | 商品: {product_name}")
+
         # 概要信息与结构日志
         print_dimensions_summary(sku_dimensions)
         write_dimensions_structure_log(sku_dimensions)
@@ -78,7 +83,20 @@ def traverse_all_sku_combinations():
 
         # 导出结果到 Excel（包含表头）：各维度 + 图片 + 图片链接 + 价格
         headers = [dim.name for dim in sku_dimensions] + ["图片", "图片链接", "价格"]
-        output_dir = Path(__file__).resolve().parent / "output"
+
+        # 根据“店铺名+商品名”建立子目录
+        def _safe_name(n: str) -> str:
+            try:
+                s = str(n)
+            except Exception:
+                s = ""
+            s = re.sub(r"[\\/:*?\"<>|]+", " ", s)
+            s = re.sub(r"\s+", " ", s).strip()
+            return (s[:80] if s else "未命名")
+
+        folder_name = f"[{_safe_name(shop_name)}]{_safe_name(product_name)}"
+        base_output = Path(__file__).resolve().parent / "output"
+        output_dir = base_output / folder_name
         output_dir.mkdir(parents=True, exist_ok=True)
         excel_path = output_dir / "result.xlsx"
         try:
