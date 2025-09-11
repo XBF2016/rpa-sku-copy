@@ -124,10 +124,27 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
                         resp.raise_for_status()
                         bio = BytesIO(resp.content)
                         pil_img = PILImage.open(bio)
-                        # 转换成RGB，避免某些模式导致嵌入失败
+                        # 统一转为 PNG 再嵌入，规避 WEBP 在 Excel 中不被支持的问题
+                        # 同时将模式规整为 RGB/RGBA，避免某些色彩模式导致嵌入失败
                         if pil_img.mode not in ("RGB", "RGBA"):
                             pil_img = pil_img.convert("RGB")
-                        xl_img = XLImage(pil_img)
+                        png_buf = BytesIO()
+                        try:
+                            pil_img.save(png_buf, format="PNG")
+                        except Exception:
+                            # 若保存 PNG 失败，退回到 RGB 再次尝试
+                            try:
+                                pil_img = pil_img.convert("RGB")
+                                png_buf = BytesIO()
+                                pil_img.save(png_buf, format="PNG")
+                            except Exception:
+                                # 还是失败则放弃嵌入，保留URL文本
+                                png_buf = None  # type: ignore
+                        if png_buf is None:
+                            continue
+                        png_buf.seek(0)
+                        pil_img_png = PILImage.open(png_buf)
+                        xl_img = XLImage(pil_img_png)
 
                         # 依据图片列列宽按比例缩放，力求完全“装入”单元格
                         img_col_letter = get_column_letter(img_col_idx + 1)
