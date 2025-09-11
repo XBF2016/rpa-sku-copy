@@ -74,7 +74,8 @@ $env:MAX_COMBOS=5; rcc run -r conf\robot.yaml
 - 可通过环境变量 `DEBUG_RPA=1` 打开调试日志；`MAX_COMBOS=N` 可限制前 N 个组合用于快速验证。
 - 导出的 Excel：
   - 新增“图片”与“图片链接”两列（均位于“价格”之前）。
-    - “图片”列：对图片链接去重后，仅下载一次并统一转为 PNG 到与 `result.xlsx` 同级目录；导出后使用 Excel COM 在单元格内插入“链接的图片”（LinkToFile=True, SaveWithDocument=False），按列宽等比缩放（默认预览宽度约 240px，在 `io_utils.py` 中可调），并调整行高展示缩略图。该方式不会把图片数据存入工作簿，Excel 体积很小。
+    - “图片”列：对图片链接去重后，仅下载一次并统一转为 PNG 到与 `result.xlsx` 同级目录；导出后使用 Excel COM 在单元格内插入“链接的图片”（LinkToFile=True, SaveWithDocument=False），按列宽等比缩放（默认预览宽度约 60px，在 `io_utils.py` 中可调），并调整行高展示缩略图。该方式不会把图片数据存入工作簿，Excel 体积很小。
+      - 作为兜底，“图片”列单元格中也会写入一个可点击的“查看图片”超链接，便于在 COM 不可用或图片未能加载时直接打开原始 URL。
       - 命名规则：`img_<图片URL的MD5前10位>.png`。
       - 若下载/转换失败或系统无法使用 COM，则退化为写入指向原始 URL 的超链接（此时不显示缩略图）。
     - “图片链接”列：保留原始图片 URL（默认列宽较宽 90，便于复制）。

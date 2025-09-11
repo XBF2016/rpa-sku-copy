@@ -3,6 +3,7 @@ from typing import List
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment
+ 
 import time
 import hashlib
 from urllib.parse import urlparse
@@ -68,43 +69,73 @@ def _insert_linked_images_via_excel(xlsx_path: Path, img_col_idx: int, url_to_fi
             pass
 
         # 逐行插入“链接的图片”
+        inserted_total = 0
+        inserted_via_file = 0
+        inserted_via_url = 0
         for r_idx, row in enumerate(results, start=2):  # Excel 行号从2开始（第1行为表头）
             try:
                 url = str(row[img_col_idx]).strip()
             except Exception:
                 url = ""
             fname = url_to_filename.get(url)
-            if not fname:
-                continue
-            png_path = (xlsx_path.parent / fname).resolve()
-            if not png_path.exists():
-                continue
+            png_path = (xlsx_path.parent / fname).resolve() if fname else None
 
             cell = ws.Cells(r_idx, img_col_idx + 1)
             left = float(cell.Left)
             top = float(cell.Top)
+            cell_w = float(cell.Width)
+            cell_h = float(cell.Height)
+            # 计算按原始比例缩放后适配单元格的尺寸（优先使用本地PNG的真实尺寸）
+            target_w, target_h = cell_w, cell_h
+            if png_path is not None and png_path.exists():
+                try:
+                    if _HAS_PILLOW:
+                        with PILImage.open(str(png_path)) as _im:
+                            ow, oh = _im.size
+                        if ow > 0 and oh > 0 and cell_w > 0 and cell_h > 0:
+                            sc = min(cell_w / float(ow), cell_h / float(oh), 1.0)
+                            target_w = max(1.0, float(ow) * sc)
+                            target_h = max(1.0, float(oh) * sc)
+                except Exception:
+                    target_w, target_h = cell_w, cell_h
+
             try:
-                shp = ws.Shapes.AddPicture(str(png_path), True, False, left, top, -1, -1)
+                # 优先使用本地 PNG 文件（若存在且路径有效）
+                if png_path is not None and png_path.exists():
+                    shp = ws.Shapes.AddPicture(str(png_path), True, False, left, top, target_w, target_h)
+                    inserted_via_file += 1
+                else:
+                    # 本地文件不可用：尝试直接使用网络 URL 插入（同样为“链接”方式）
+                    if url and (url.startswith("http://") or url.startswith("https://")):
+                        shp = ws.Shapes.AddPicture(str(url), True, False, left, top, cell_w, cell_h)
+                        inserted_via_url += 1
+                    else:
+                        continue
             except Exception:
-                # 某些版本可能需要 AddPicture2，但通常 AddPicture 即可
-                continue
+                # 兼容部分版本：尝试 AddPicture2
+                try:
+                    if png_path is not None and png_path.exists():
+                        shp = ws.Shapes.AddPicture2(str(png_path), True, False, left, top, target_w, target_h)
+                        inserted_via_file += 1
+                    else:
+                        if url and (url.startswith("http://") or url.startswith("https://")):
+                            shp = ws.Shapes.AddPicture2(str(url), True, False, left, top, cell_w, cell_h)
+                            inserted_via_url += 1
+                        else:
+                            continue
+                except Exception:
+                    continue
 
             try:
                 # 随单元格移动与缩放
                 shp.Placement = 1  # xlMoveAndSize
                 shp.LockAspectRatio = True
-                # 将链接源改为相对文件名，便于与工作簿同目录移动
-                try:
-                    shp.LinkFormat.SourceFullName = png_path.name
-                except Exception:
-                    pass
+                # 仅设置可读的替代文本，避免修改链接源导致某些环境下路径解析问题
                 try:
                     shp.AlternativeText = png_path.name
                 except Exception:
                     pass
-                # 按单元格完整尺寸等比缩放（无内边距）
-                cell_w = float(cell.Width)
-                cell_h = float(cell.Height)
+                # 再次确保完全贴合单元格边界（等比缩放）
                 if cell_w > 0 and cell_h > 0 and shp.Width and shp.Height:
                     scale = min(cell_w / max(1.0, float(shp.Width)), cell_h / max(1.0, float(shp.Height)), 1.0)
                     shp.Width = max(1.0, float(shp.Width) * scale)
@@ -114,9 +145,16 @@ def _insert_linked_images_via_excel(xlsx_path: Path, img_col_idx: int, url_to_fi
                 shp.Top = float(cell.Top) + max(0.0, (float(cell.Height) - float(shp.Height)) / 2.0)
             except Exception:
                 pass
+            else:
+                inserted_total += 1
 
         wb.Save()
         wb.Close(SaveChanges=True)
+        try:
+            if inserted_via_file or inserted_via_url:
+                print(f"[步骤] 已通过Excel COM插入图片: 本地文件 {inserted_via_file} 张，网络URL {inserted_via_url} 张")
+        except Exception:
+            pass
     finally:
         try:
             excel.Quit()
@@ -126,8 +164,8 @@ def _insert_linked_images_via_excel(xlsx_path: Path, img_col_idx: int, url_to_fi
 def export_results_to_excel(results: List[List[str]], headers: List[str], file_path: Path) -> None:
     """使用 openpyxl 将结果写入 Excel（含表头）。
     行为说明：
-    - 若表头包含“图片”列：对图片链接去重后，仅下载一次并统一转为 PNG 保存到与 result.xlsx 同级目录；然后在“图片”列中按列宽嵌入显示（可见缩略图）。
-      - 无 Pillow 或下载/转换失败时，退化为在“图片”列写入原始 URL 的超链接。
+    - 若表头包含“图片”列：对图片链接去重后，仅下载一次并统一转为 PNG 保存到与 result.xlsx 同级目录；导出后通过 Excel COM 在“图片”列以“链接的图片”方式显示缩略图（不嵌入，体积小，默认预览宽高约 60px）。
+      - 无 Pillow/requests 或下载失败/COM 不可用时，退化为在“图片”列写入原始 URL 的超链接（文本为“查看图片”）。
     - “图片链接”列保留原始网络 URL。
     - 全表统一样式：水平/垂直居中，自动换行；文本列近似自适应列宽。
     - 若最后一列表头为“价格”，将该列写为纯数值（去掉人民币符号与千分位）。
@@ -185,7 +223,18 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
             if target.exists():
                 continue
             try:
-                resp = requests.get(u, timeout=15)
+                # 加强下载头，提升电商站点直链下载成功率
+                headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
+                    ),
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Referer": f"{urlparse(u).scheme}://{urlparse(u).hostname}/",
+                    "Connection": "keep-alive",
+                }
+                resp = requests.get(u, headers=headers, timeout=20)
                 resp.raise_for_status()
                 from io import BytesIO
                 bio = BytesIO(resp.content)
@@ -207,8 +256,8 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
     # 统一设置图片与链接列列宽（若存在）
     if img_col_idx != -1:
         col_letter = get_column_letter(img_col_idx + 1)
-        # 设定预览列宽（像素 -> 列宽），适当加大到 240px
-        _IMG_PREVIEW_PX = 240
+        # 设定预览列宽（像素 -> 列宽），缩小为原 1/4（60px）
+        _IMG_PREVIEW_PX = 60
         ws.column_dimensions[col_letter].width = _px_to_col_width(_IMG_PREVIEW_PX)
     if img_link_col_idx != -1:
         col_letter_link = get_column_letter(img_link_col_idx + 1)
@@ -250,7 +299,15 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
             if j < len(max_text_len) and txt_len > max_text_len[j]:
                 max_text_len[j] = txt_len
 
-        # 不再由 openpyxl 嵌入图片，这里不做处理；显示交由 Excel COM 完成
+        # 在“图片”列写入一个备用超链接（文本：查看图片），即使后续通过 COM 插入了缩略图，超链接也不会产生负面影响
+        if img_col_idx != -1 and img_col_idx < len(headers):
+            try:
+                if img_url_cur and isinstance(img_url_cur, str) and img_url_cur.strip().lower().startswith(("http://", "https://")):
+                    cell = ws.cell(row=current_row, column=img_col_idx + 1)
+                    cell.value = "查看图片"
+                    cell.hyperlink = img_url_cur
+            except Exception:
+                pass
 
     # 文本列近似自适应列宽（跳过“图片”与“图片链接”列）
     for j in range(len(headers)):
@@ -264,8 +321,8 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
     # 若存在图片列，给数据行一个适中的行高，便于后续 COM 插入的图片按单元格自适应可见
     if img_col_idx != -1:
         try:
-            # 行高与预览保持一致（像素 -> point），此处取 240px，保证图片更清晰
-            _IMG_PREVIEW_PX_H = 240
+            # 行高与预览保持一致（像素 -> point），缩小为 60px
+            _IMG_PREVIEW_PX_H = 60
             target_row_h_pts = _px_to_points(_IMG_PREVIEW_PX_H)
             for r in range(2, ws.max_row + 1):
                 cur_h = ws.row_dimensions[r].height or 0
@@ -287,7 +344,7 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
         except Exception as e2:
             print(f"[错误] 导出Excel失败: {e2}")
             raise
-
+    
     # 使用 Excel COM 将图片以“链接方式”插入到单元格中（不占用 Excel 体积）
     try:
         _insert_linked_images_via_excel(final_path, img_col_idx, url_to_filename, results)
