@@ -82,6 +82,7 @@ $env:MAX_COMBOS=5; rcc run -r conf\robot.yaml
   - 全表样式：所有单元格均设置为“水平居中 + 垂直居中 + 自动换行”。
   - 列宽：除“图片/图片链接”外的文本列，会根据内容长度做近似自适应列宽（限定在 10~40 之间，避免过宽/过窄）。
   - “价格”列表头识别为“价格”时会以纯数值写入（自动去掉货币符号与千分位），方便后续做数值计算与筛选。
+  - 自动合并：同一列中相邻且值相同的单元格会自动合并（包含“图片”列按原始 URL 判断是否相同）。合并后，仅在合并区域首行插入“链接的图片”，并按合并区域的总宽高等比缩放、居中显示。
   - 主图提取：`sku_utils.get_main_image_url()` 已增强：
     - 顺序：`<img>.currentSrc/src/srcset/placeholder/data-src/data-ks-lazyload/...`、`<picture><source srcset>`；
     - 兜底：放大镜容器 `.js-image-zoom__zoomed-image` 的 `background-image`；`[class*='mainPicWrap']` 自身的 `background-image`；

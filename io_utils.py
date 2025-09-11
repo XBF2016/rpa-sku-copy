@@ -3,6 +3,7 @@ from typing import List
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment
+from common import append_to_log
  
 import time
 import hashlib
@@ -48,6 +49,10 @@ def _insert_linked_images_via_excel(xlsx_path: Path, img_col_idx: int, url_to_fi
             print("[提示] 未安装 win32com（pywin32），将不会在表格中插入可见图片，仅保留链接列。")
         except Exception:
             pass
+        try:
+            append_to_log("未安装/不可用的 Excel COM，跳过插入‘链接的图片’，仅保留超链接")
+        except Exception:
+            pass
         return
 
     excel = win32.Dispatch("Excel.Application")
@@ -81,10 +86,31 @@ def _insert_linked_images_via_excel(xlsx_path: Path, img_col_idx: int, url_to_fi
             png_path = (xlsx_path.parent / fname).resolve() if fname else None
 
             cell = ws.Cells(r_idx, img_col_idx + 1)
+            # 若该单元格处于合并区域中，且不是合并区域的首行，则跳过，避免重复插入同一张图片
+            try:
+                if cell.MergeCells:
+                    try:
+                        top_row = int(cell.MergeArea.Row)
+                    except Exception:
+                        top_row = int(cell.Row)
+                    if int(cell.Row) != top_row:
+                        continue
+            except Exception:
+                pass
             left = float(cell.Left)
             top = float(cell.Top)
-            cell_w = float(cell.Width)
-            cell_h = float(cell.Height)
+            # 若为合并单元格，优先使用整个合并区域的宽高，确保图片能铺满合并后的单元格
+            try:
+                if cell.MergeCells:
+                    area = cell.MergeArea
+                    cell_w = float(area.Width)
+                    cell_h = float(area.Height)
+                else:
+                    cell_w = float(cell.Width)
+                    cell_h = float(cell.Height)
+            except Exception:
+                cell_w = float(cell.Width)
+                cell_h = float(cell.Height)
             # 计算按原始比例缩放后适配单元格的尺寸（优先使用本地PNG的真实尺寸）
             target_w, target_h = cell_w, cell_h
             if png_path is not None and png_path.exists():
@@ -140,9 +166,9 @@ def _insert_linked_images_via_excel(xlsx_path: Path, img_col_idx: int, url_to_fi
                     scale = min(cell_w / max(1.0, float(shp.Width)), cell_h / max(1.0, float(shp.Height)), 1.0)
                     shp.Width = max(1.0, float(shp.Width) * scale)
                     shp.Height = max(1.0, float(shp.Height) * scale)
-                # 居中对齐（至少有一边会完全贴合单元格边界，比例不变）
-                shp.Left = float(cell.Left) + max(0.0, (float(cell.Width) - float(shp.Width)) / 2.0)
-                shp.Top = float(cell.Top) + max(0.0, (float(cell.Height) - float(shp.Height)) / 2.0)
+                # 居中对齐（至少有一边会完全贴合单元格边界，比例不变）。若为合并区域，则基于合并区域宽高进行居中。
+                shp.Left = float(cell.Left) + max(0.0, (float(cell_w) - float(shp.Width)) / 2.0)
+                shp.Top = float(cell.Top) + max(0.0, (float(cell_h) - float(shp.Height)) / 2.0)
             except Exception:
                 pass
             else:
@@ -155,20 +181,81 @@ def _insert_linked_images_via_excel(xlsx_path: Path, img_col_idx: int, url_to_fi
                 print(f"[步骤] 已通过Excel COM插入图片: 本地文件 {inserted_via_file} 张，网络URL {inserted_via_url} 张")
         except Exception:
             pass
+        try:
+            if inserted_total:
+                append_to_log(f"通过 Excel COM 插入图片完成：本地 {inserted_via_file}，网络 {inserted_via_url}，总计 {inserted_total}")
+            else:
+                append_to_log("Excel COM 插入图片数量为 0：可能需要在 Excel 中点击‘启用内容’或检查图片本地文件/网络可达性")
+        except Exception:
+            pass
     finally:
         try:
             excel.Quit()
         except Exception:
             pass
 
-def export_results_to_excel(results: List[List[str]], headers: List[str], file_path: Path) -> None:
-    """使用 openpyxl 将结果写入 Excel（含表头）。
+def _merge_consecutive_cells(ws, results: List[List[str]], headers: List[str], img_col_idx: int) -> None:
+    """按列合并相邻且值相同的单元格（第1行为表头，从第2行开始）。
+    - 对“图片”列：基于原始图片 URL 判断是否相同（而不是单元格显示的“查看图片”文本）。
+    - 其他列：基于写入的值进行等值判断（去掉首尾空白；数值按原值）。
+    """
+    try:
+        if not results or not headers:
+            return
+        n_rows = len(results)
+        n_cols = len(headers)
+
+        def get_key(row_idx0: int, col_idx0: int):
+            try:
+                val = results[row_idx0][col_idx0]
+            except Exception:
+                return ""
+            if col_idx0 == img_col_idx:
+                try:
+                    return str(val).strip()
+                except Exception:
+                    return ""
+            # 非图片列：数值原值，文本去空白
+            if isinstance(val, (int, float)):
+                return val
+            try:
+                return str(val).strip()
+            except Exception:
+                return ""
+
+        for col in range(n_cols):
+            start = 0  # results 的 0 基索引（对应 Excel 的第 2 行）
+            prev_key = get_key(0, col) if n_rows > 0 else None
+            for i in range(1, n_rows + 1):  # 走到 n_rows 作为哨兵触发收尾
+                key = get_key(i, col) if i < n_rows else None
+                same = (key == prev_key) and (key not in (None, ""))
+                if same:
+                    continue
+                # 结束上一段
+                seg_len = i - start
+                if seg_len >= 2 and (prev_key not in (None, "")):
+                    r1 = start + 2  # +1 表头 +1 从 0 到 Excel 行
+                    r2 = i + 1
+                    c = col + 1
+                    try:
+                        ws.merge_cells(start_row=r1, end_row=r2, start_column=c, end_column=c)
+                    except Exception:
+                        pass
+                start = i
+                prev_key = key
+    except Exception:
+        # 合并失败不影响导出
+        pass
+
+def export_results_to_excel(results: List[List[str]], headers: List[str], file_path: Path) -> Path:
+    """使用 openpyxl 将结果写入 Excel（含表头），返回最终保存的文件路径（可能是带时间戳的备选文件）。
     行为说明：
     - 若表头包含“图片”列：对图片链接去重后，仅下载一次并统一转为 PNG 保存到与 result.xlsx 同级目录；导出后通过 Excel COM 在“图片”列以“链接的图片”方式显示缩略图（不嵌入，体积小，默认预览宽高约 60px）。
       - 无 Pillow/requests 或下载失败/COM 不可用时，退化为在“图片”列写入原始 URL 的超链接（文本为“查看图片”）。
     - “图片链接”列保留原始网络 URL。
     - 全表统一样式：水平/垂直居中，自动换行；文本列近似自适应列宽。
     - 若最后一列表头为“价格”，将该列写为纯数值（去掉人民币符号与千分位）。
+    - 自动合并：同一列中相邻且值相同的单元格会自动合并（含“图片”列按原始 URL 判断）。合并后，仅在合并区域首行插入“链接的图片”，并按合并区域尺寸进行等比缩放与居中。
     """
     wb = Workbook()
     ws = wb.active
@@ -224,7 +311,7 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
                 continue
             try:
                 # 加强下载头，提升电商站点直链下载成功率
-                headers = {
+                req_headers = {
                     "User-Agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
@@ -234,7 +321,7 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
                     "Referer": f"{urlparse(u).scheme}://{urlparse(u).hostname}/",
                     "Connection": "keep-alive",
                 }
-                resp = requests.get(u, headers=headers, timeout=20)
+                resp = requests.get(u, headers=req_headers, timeout=20)
                 resp.raise_for_status()
                 from io import BytesIO
                 bio = BytesIO(resp.content)
@@ -330,6 +417,12 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
         except Exception:
             pass
 
+    # 保存前：按列合并相邻相同值（包含“图片”列基于URL判断）
+    try:
+        _merge_consecutive_cells(ws, results, headers, img_col_idx)
+    except Exception:
+        pass
+
     # 保存工作簿；若被占用则自动降级另存为 result_YYYYMMDD_HHMMSS.xlsx
     final_path = file_path
     try:
@@ -351,3 +444,4 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
     except Exception:
         # 插入失败不影响导出
         pass
+    return final_path
