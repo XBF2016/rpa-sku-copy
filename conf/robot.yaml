@@ -3,7 +3,7 @@ tasks:
     shell: python -m robocorp.tasks run ../main.py -t traverse_all_sku_combinations
 
 condaConfigFile: conda.yaml
-artifactsDir: ../robocorp
+artifactsDir: ../output
 PATH:
   - ..
 PYTHONPATH:

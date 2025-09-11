@@ -23,7 +23,7 @@
 - `robot.yaml`：Robocorp 任务描述，已指向上级目录的 `main.py`：
   - `shell: python -m robocorp.tasks run ../main.py -t traverse_all_sku_combinations`
   - `condaConfigFile: conda.yaml`
-  - `artifactsDir: ../output`
+  - `artifactsDir: ../output`（可按需修改）。运行时 RCC 会注入环境变量 `ROBOT_ARTIFACTS` 指向该目录，代码将优先使用此目录作为导出根目录。
   - `PATH: ['..']`，`PYTHONPATH: ['..']`
 - `conda.yaml`：Python 环境依赖（包含 robocorp-tasks、selenium、openpyxl 等）。
   - 现已增加 `pillow` 依赖，用于在 Excel 中嵌入图片。
@@ -41,8 +41,33 @@
 2. 通过 `robot.yaml` 运行（需要 `rcc` 环境）：
    ```powershell
    # 从项目根目录执行
-   rcc run conf\robot.yaml
+   rcc run -r conf\robot.yaml
    ```
+
+### 安装 RCC（Windows）
+如果本机还未安装 `rcc`，可按以下步骤安装（无需管理员权限）：
+
+```powershell
+# 1) 创建用户级 bin 目录（若已存在会跳过）
+New-Item -ItemType Directory -Force "$env:USERPROFILE\bin" | Out-Null
+
+# 2) 下载 rcc.exe 到该目录（使用官方下载地址）
+Invoke-WebRequest -UseBasicParsing -Uri "https://downloads.robocorp.com/rcc/releases/latest/windows64/rcc.exe" -OutFile "$env:USERPROFILE\bin\rcc.exe"
+
+# 3) 将该目录加入当前会话的 PATH（仅对本次 PowerShell 会话生效）
+$env:PATH = "$env:USERPROFILE\bin;" + $env:PATH
+
+# 4) 验证安装是否成功
+rcc --version
+```
+
+安装完成后，即可通过：
+
+```powershell
+$env:MAX_COMBOS=5; rcc run -r conf\robot.yaml
+```
+
+来仅跑 5 条进行快速验证。
 
 ## 其他
 - 控制台/日志统一中文输出；价格文本统一替换 `¥` 为 `￥` 以避免 GBK 编码问题。
@@ -62,7 +87,8 @@
     - 在点击SKU后做短轮询等待（~0.8s）并尝试触发一次主图区域的悬停，以促使放大镜背景图预加载。
 
 ### 导出文件存放路径
-- 结果文件将保存为：`output/[店铺名]商品名/result.xlsx`
+- 若通过 `robot.yaml`（RCC）运行：结果文件将保存为：`<artifactsDir>/[店铺名]商品名/result.xlsx`，其中 `<artifactsDir>` 由 `conf/robot.yaml` 的 `artifactsDir` 控制（默认 `../output`）。
+- 若直接本地运行（未通过 RCC/robot.yaml）：结果文件将保存为：`output/[店铺名]商品名/result.xlsx`
 - “店铺名/商品名”的解析基于元素示例：
   - 商品名：`元素示例/商品名.html`（选择器：`[class*='mainTitle--']`）
   - 店铺名：`元素示例/店铺名.html`（选择器：`[class*='shopName--']`）
