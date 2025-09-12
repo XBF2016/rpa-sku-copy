@@ -431,42 +431,99 @@ def _find_spec_value_input(driver: webdriver.Edge, dim: str):
 
 
 def input_options_for_dimension(driver: webdriver.Edge, dim: str, options: List[str]) -> None:
-    """在给定维度的输入框中，依次输入选项并回车。"""
+    """极速模式：先批量输入，再统一校验补录一次。
+    - 每个选项输入后仅做极短 20-30ms 等待，依靠 forCreate 空白输入框持续可用快速连输。
+    - 一轮结束后统一检查哪些选项仍缺失，再补录一轮（最多 1 次）。
+    """
     if not options:
         print(f"[信息] 维度“{dim}”未配置任何选项，跳过输入")
         return
-    for val in options:
-        # 若该选项已存在则跳过（幂等）
-        if _option_exists_in_dimension(driver, dim, val):
-            print(f"[跳过] 维度“{dim}”已存在选项：{val}")
-            continue
-        ok = False
-        for attempt in range(3):
+
+    # 先一次性获取已存在选项集合，筛出缺失
+    existing_set = _list_existing_options_set(driver, dim)
+    pending = [v for v in options if v not in existing_set]
+    if not pending:
+        print(f"[信息] 维度“{dim}”的所有选项均已存在，跳过输入")
+        return
+
+    def _fast_type_one(val: str) -> bool:
+        for attempt in range(2):
             try:
                 inp = _find_spec_value_input(driver, dim)
                 if not inp:
-                    print(f"[错误] 未找到维度“{dim}”的输入框，终止该维度的选项录入")
-                    break
+                    return False
                 driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", inp)
-                inp.clear()
                 inp.send_keys(val)
                 inp.send_keys(Keys.ENTER)
-                # 等待该选项出现在页面
-                try:
-                    WebDriverWait(driver, 5).until(lambda d: _option_exists_in_dimension(d, dim, val))
-                    print(f"[步骤] 维度“{dim}”已添加选项：{val}")
-                    ok = True
-                    break
-                except Exception:
-                    time.sleep(0.2)
+                time.sleep(0.01)  # 极短暂刷新
+                return True
             except (StaleElementReferenceException, WebDriverException):
-                time.sleep(0.2)
+                time.sleep(0.01)
                 continue
-            except Exception as e:
-                print(f"[警告] 输入选项失败（维度={dim}，选项={val}）：{e}")
-                break
-        if not ok:
-            print(f"[警告] 未能确认选项已添加（维度={dim}，选项={val}），可能页面结构变化或网络因素")
+            except Exception:
+                return False
+        return False
+
+    # 在批量连输阶段，临时关闭隐式等待，避免 find_element 未命中时自动等待2秒导致总时延接近5秒
+    try:
+        driver.implicitly_wait(0)
+        # 第一轮：极速连输
+        for v in list(pending):
+            if _option_exists_in_dimension(driver, dim, v):
+                pending.remove(v)
+                continue
+            ok = _fast_type_one(v)
+            if ok:
+                # 不等待，下一项
+                pass
+            else:
+                print(f"[警告] 快速输入失败（维度={dim}，选项={v}），稍后重试")
+
+        # 校验缺失，补录一轮（用集合快速比对）
+        existing_set2 = _list_existing_options_set(driver, dim)
+        missing = [v for v in pending if v not in existing_set2]
+        if not missing:
+            return
+        for v in missing:
+            ok = _fast_type_one(v)
+            if not ok:
+                print(f"[警告] 仍未能添加该选项（维度={dim}，选项={v}），请稍后手动检查或重跑任务")
+    finally:
+        # 恢复隐式等待
+        try:
+            driver.implicitly_wait(2)
+        except Exception:
+            pass
+
+
+def _list_existing_options_set(driver: webdriver.Edge, dim: str) -> Set[str]:
+    """列出维度容器下已存在的全部选项值（包含以 input.value 呈现的项和可见文本项）。"""
+    s: Set[str] = set()
+    container = _get_spec_container(driver, dim)
+    if not container:
+        return s
+    try:
+        # 以输入框 value 呈现的值（已添加的选项旁通常有删除图标）
+        nodes_inp = container.find_elements(By.XPATH, ".//input[@type='text']")
+        for n in nodes_inp:
+            v = (n.get_attribute("value") or "").strip()
+            if v:
+                s.add(v)
+    except Exception:
+        pass
+    try:
+        # 以文本呈现的标签
+        nodes_txt = container.find_elements(
+            By.XPATH,
+            ".//div[contains(@class,'style_skuValue__') or contains(@class,'style_skuValue__OsgA1')]//*[normalize-space(text())!='']",
+        )
+        for n in nodes_txt:
+            t = (n.text or "").strip()
+            if t:
+                s.add(t)
+    except Exception:
+        pass
+    return s
 
 def _get_spec_container(driver: webdriver.Edge, dim: str):
     container_xpath = SPEC_VALUE_CONTAINER_XPATH_TMPL.format(dim=dim)

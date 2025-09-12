@@ -94,6 +94,10 @@
 - 导航备用方案：若 `driver.get(url)` 后仍停留在空白页，将尝试 `window.open(url)` 新标签并切换，仍不行则用 `location.href = url` 脚本导航。
 - 驱动与附加模式回退：若本地 EdgeDriver 启动失败（DevToolsActivePort/failed to start/crashed），程序会自动回退为 Selenium Manager 自动匹配；若仍失败，将自动启动带 `--remote-debugging-port` 的 Edge 并“附加”连接；如果依然失败，最后回退到临时用户数据目录（`temp/edge-user-data`）启动全新会话。
 
+## 性能与速度
+- 规格选项录入采用“极速批量输入”模式：先在“新增用输入框”快速连输（每项仅约 20~30ms 极短等待），一轮结束后统一校验缺失项并补录一次，显著减少每项的等待时间。
+- 若你的页面网络或设备较慢，导致个别选项首次未识别，也会在补录阶段自动补齐；如仍有漏项，可再次运行任务，程序会幂等跳过已存在内容，仅补缺。
+
 ## 注意事项
 - 首次运行可能需要登录抖店后台：程序会在未检测到“添加规格类型”按钮时提示等待登录，然后继续。
 - 若 `conf/douyin/product-url.txt` 不存在，将自动回退使用 `conf/product-url.txt`。
