@@ -23,7 +23,10 @@
 - 全部中文注释、中文日志、中文报错。
 
 ## 目录结构（相关文件）
-- `main.py`：任务入口，定义任务 `create_douyin_spec_dimensions`
+- `main.py`：任务入口，仅负责任务编排与入口（调用下述模块）
+- `config.py`：路径常量与配置读取（浏览器路径、商品链接、规格 YAML 最简解析）
+- `driver_utils.py`：浏览器启动与稳健导航、登录等待等通用流程
+- `douyin_actions.py`：抖店页面元素与动作（创建维度、录入选项、保存草稿等）
 - `conf/browser.txt`：Edge 浏览器可执行文件路径（例如：`C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe`）
 - `conf/product-url.txt`：商品上架草稿页链接（若 `conf/douyin/product-url.txt` 不存在，则回退使用本文件）
 - `conf/douyin/product-url.txt`：商品上架草稿页链接（优先读取）
@@ -104,6 +107,10 @@
 - `driver/msedgedriver.exe` 建议放置在 `driver/` 目录下以避免系统路径差异。
 
 ## 变更说明
-- `main.py`：实现“创建维度 + 录入选项 + 保存草稿”的完整流程；新增稳健导航与浏览器启动回退；启动前自动关闭 Edge。
-- `conf/robot.yaml`：新增任务 `Create Douyin Spec Dimensions`，一键运行。
-- `README.md`：同步更新能力说明、配置格式与元素说明。
+- 完成重构与拆分：
+  - `main.py`：精简为任务编排入口
+  - `config.py`：新增，承载路径常量与配置读取
+  - `driver_utils.py`：新增，承载浏览器启动、导航与登录等待
+  - `douyin_actions.py`：新增，承载抖店页面元素与操作
+- `conf/robot.yaml`：任务入口保持不变（仍指向 `../main.py`）。
+- `README.md`：同步更新目录结构与说明。
