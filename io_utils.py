@@ -445,3 +445,206 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
         # 插入失败不影响导出
         pass
     return final_path
+
+
+def export_results_to_yaml(sku_dimensions, results: List[List[str]], headers: List[str], file_path: Path) -> Path:
+    """将规格维度与组合信息导出为更紧凑的 YAML：
+    - specs: 维度 -> 选项列表（与示例一致，便于人工查看）
+    - dims:  维度名称顺序（用于索引解释）
+    - imgs:  去重后的图片URL列表
+    - imgs_local: 与 imgs 同索引的本地图片文件名（位于 output 子目录）
+    - combos: 紧凑列表，每行 = [每个维度的选项索引..., 价格, 图片索引]
+      说明：
+        - 选项索引为基于 specs[维度] 中的序号（从 0 开始）
+        - 价格为数值（若无法解析则为 null）
+        - 图片索引为基于 imgs 的序号（从 0 开始；无图则为 null）
+    """
+    # 计算维度名称列表（与 headers 对齐）
+    try:
+        dim_names = [str(h) for h in headers[:-3]] if len(headers) >= 3 else [getattr(d, 'name', f'维度{i+1}') for i, d in enumerate(sku_dimensions)]
+    except Exception:
+        dim_names = [getattr(d, 'name', f'维度{i+1}') for i, d in enumerate(sku_dimensions)]
+
+    # 构建 specs 映射：维度 -> 选项列表，并保留维度顺序
+    specs_map = {}
+    try:
+        for d in sku_dimensions:
+            name = str(getattr(d, 'name', '') or '')
+            opts = []
+            try:
+                for o in getattr(d, 'options', []) or []:
+                    txt = str(getattr(o, 'text', '') or '').strip()
+                    if txt:
+                        opts.append(txt)
+            except Exception:
+                pass
+            if name and opts:
+                specs_map[name] = opts
+    except Exception:
+        specs_map = {}
+
+    # 构建选项文本 -> 索引 的映射（加速查找）
+    option_index_map = {}
+    try:
+        for dim in dim_names:
+            options = specs_map.get(dim, [])
+            option_index_map[dim] = {opt: idx for idx, opt in enumerate(options)}
+    except Exception:
+        option_index_map = {}
+
+    # 简单的YAML转义（尽量减少依赖）
+    def _yaml_escape_value(val: str) -> str:
+        try:
+            s = '' if val is None else str(val)
+        except Exception:
+            s = ''
+        needs_quote = False
+        if not s:
+            needs_quote = True
+        if (s.strip() != s) or any(ch in s for ch in [':', '#', '{', '}', '[', ']', ',', '&', '*', '!', '|', '>', "'", '"', '%', '@', '`']):
+            needs_quote = True
+        lowered = s.lower()
+        if lowered in ("null", "true", "false", "yes", "no", "on", "off"):
+            needs_quote = True
+        if needs_quote:
+            s = s.replace('\\', r'\\').replace('"', r'\"')
+            return f'"{s}"'
+        return s
+
+    def _yaml_escape_key(key: str) -> str:
+        # key 与 value 同步处理，尽量安全
+        return _yaml_escape_value(key)
+
+    # 提取价格：返回 (price_float_or_none, price_text)
+    def _extract_price(val) -> tuple:
+        try:
+            if isinstance(val, (int, float)):
+                return float(val), f"{val}"
+        except Exception:
+            pass
+        try:
+            s = str(val or '').strip()
+        except Exception:
+            s = ''
+        # 同 Excel 逻辑：抽取首个数字片段
+        try:
+            tokens = ''.join((c if (c.isdigit() or c in '.,') else ' ') for c in s).split()
+            for t in tokens:
+                if any(ch.isdigit() for ch in t):
+                    try:
+                        return float(t.replace(',', '')), s
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return None, s
+
+    # 去重图片，建立 imgs 列表与 url->idx 映射
+    imgs: List[str] = []
+    img_to_idx = {}
+    dim_count = len(dim_names)
+    for row in results or []:
+        try:
+            img_link = ''
+            if len(row) >= dim_count + 2:
+                img_link = str(row[dim_count + 1] or '').strip()
+            if img_link and (img_link.startswith('http://') or img_link.startswith('https://')):
+                if img_link not in img_to_idx:
+                    img_to_idx[img_link] = len(imgs)
+                    imgs.append(img_link)
+        except Exception:
+            continue
+
+    # 生成 imgs_local（与 imgs 对齐）。文件名规则与 Excel 导出一致：img_<md5(url)的前10位>.png
+    imgs_local: List[str | None] = []  # None 表示本地文件不存在
+    out_dir = file_path.parent
+    for u in imgs:
+        try:
+            short = hashlib.md5(u.encode('utf-8')).hexdigest()[:10]
+            fname = f"img_{short}.png"
+            if (out_dir / fname).exists():
+                imgs_local.append(fname)
+            else:
+                imgs_local.append(None)
+        except Exception:
+            imgs_local.append(None)
+
+    # 生成 YAML 文本（紧凑形式 + 注释）
+    lines: List[str] = []
+    lines.append('# 本文件由 RPA 自动生成：存储淘宝商品规格与组合信息（紧凑表示）\n')
+    lines.append('# 读取提示：先用 dims 与 specs 解析索引，再结合 combos 使用。\n')
+    lines.append('specs:\n')
+    for dim_name, options in specs_map.items():
+        lines.append(f"  {_yaml_escape_key(dim_name)}:\n")
+        for opt in options:
+            lines.append(f"    - {_yaml_escape_value(opt)}\n")
+
+    lines.append('\n# 维度名称顺序（与 specs 对齐，用于解释索引）\n')
+    # 维度顺序
+    lines.append('dims:\n')
+    for dim in dim_names:
+        lines.append(f"  - {_yaml_escape_key(dim)}\n")
+
+    lines.append('\n# 去重后的图片URL；与 imgs_local 一一对应\n')
+    # 图片去重表
+    lines.append('imgs:\n')
+    for u in imgs:
+        lines.append(f"  - {_yaml_escape_value(u)}\n")
+
+    lines.append('\n# 本地图片文件名（位于输出子目录）；与 imgs 同索引对齐\n')
+    lines.append('imgs_local:\n')
+    for fn in imgs_local:
+        if fn is None:
+            lines.append('  - null\n')
+        else:
+            lines.append(f"  - {_yaml_escape_value(fn)}\n")
+
+    lines.append('\n# 紧凑组合：每行 = [各维度选项索引..., 价格, 图片索引]\n')
+    lines.append('# 说明：选项索引基于 specs[dims[i]]（0 起）；价格为数值或 null；图片索引基于 imgs（0 起）或 null\n')
+    # 紧凑组合：行内序列（flow style）：[d0, d1, ..., price, imgIdx]
+    lines.append('combos:\n')
+    for row in results or []:
+        try:
+            # 维度索引列表
+            idx_list: List[str] = []
+            for i in range(dim_count):
+                dim_n = dim_names[i] if i < len(dim_names) else f"维度{i+1}"
+                try:
+                    v_txt = str(row[i]).strip()
+                except Exception:
+                    v_txt = ''
+                idx = option_index_map.get(dim_n, {}).get(v_txt, -1)
+                idx_list.append(str(idx))
+            # 价格
+            price_val = row[-1] if row else ''
+            price_num, _price_text = _extract_price(price_val)
+            price_repr = 'null' if price_num is None else (str(price_num))
+            # 图片索引
+            img_link = ''
+            if len(row) >= dim_count + 2:
+                try:
+                    img_link = str(row[dim_count + 1] or '').strip()
+                except Exception:
+                    img_link = ''
+            img_idx = img_to_idx.get(img_link, None) if img_link else None
+            img_repr = 'null' if (img_idx is None) else str(int(img_idx))
+            # 合成一行：-[idxs..., price, imgIdx]
+            arr = ', '.join(idx_list + [price_repr, img_repr])
+            lines.append(f"  - [{arr}]\n")
+        except Exception:
+            continue
+
+    # 写入文件
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.writelines(lines)
+
+    try:
+        print(f"[步骤] 已导出YAML到: {file_path}")
+    except Exception:
+        pass
+    try:
+        append_to_log(f"导出YAML完成: {file_path}")
+    except Exception:
+        pass
+    return file_path

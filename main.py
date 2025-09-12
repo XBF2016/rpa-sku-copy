@@ -25,7 +25,7 @@ from traversal import (
     apply_max_combos_limit,
     traverse_and_collect,
 )
-from io_utils import export_results_to_excel
+from io_utils import export_results_to_excel, export_results_to_yaml
 
 
 @task
@@ -106,11 +106,17 @@ def traverse_all_sku_combinations():
         output_dir = base_output / folder_name
         output_dir.mkdir(parents=True, exist_ok=True)
         excel_path = output_dir / "result.xlsx"
+        yaml_path = output_dir / "result.yml"
         try:
             export_results_to_excel(results, headers, excel_path)
             print(f"[步骤] 已导出结果到: {excel_path}")
         except Exception as e:
             print(f"[错误] 导出Excel失败: {e}")
+        # 额外导出YAML
+        try:
+            export_results_to_yaml(sku_dimensions, results, headers, yaml_path)
+        except Exception as e:
+            print(f"[错误] 导出YAML失败: {e}")
 
     finally:
         try:
