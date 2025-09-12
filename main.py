@@ -4,10 +4,10 @@
 
 说明：
 - 从 conf/douyin/product-url.txt 读取商品草稿链接（若不存在则回退 conf/product-url.txt）
-- 从 conf/规格.yml 读取需要创建的“维度”（仅顶层键名，不创建选项）
+- 从 conf/规格.yml 读取需要创建的“维度”与每个维度的“选项”（顶层键名为维度，缩进的“- 项”为选项）
 - 打开浏览器访问草稿页，依次点击“添加规格类型”，展开“规格类型下拉按钮”，在下拉列表中选择维度；
   若列表没有该维度，则点击“创建类型”，在弹出的输入框中输入维度名并回车。
-- 代码内全部中文日志与注释，严格参考 “元素示例/” 下的文件来定位元素。
+- 代码内全部中文日志与注释，严格参考 “元素示例/” 下的文件来定位元素；录入完所有维度选项后点击“保存草稿”。
 
 注意：
 - 本实现不依赖 PyYAML，为减少依赖与改动，采用最简行解析从 conf/规格.yml 提取顶层键作为维度名。
@@ -30,8 +30,23 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.edge.service import Service as EdgeService
-from selenium.common.exceptions import SessionNotCreatedException, WebDriverException
+from selenium.common.exceptions import SessionNotCreatedException, WebDriverException, StaleElementReferenceException
 from selenium.webdriver.edge.options import Options as EdgeOptions
+# 优先复用已有工具；若导入失败则本文件内提供兜底实现
+try:
+    from browser_utils import kill_edge_processes
+except Exception:
+    def kill_edge_processes() -> None:
+        """强制结束 Edge 相关进程（msedge.exe、msedgewebview2.exe）。"""
+        try:
+            import subprocess as _sub
+            for image in ("msedge.exe", "msedgewebview2.exe"):
+                try:
+                    _sub.run(["taskkill", "/IM", image, "/F"], capture_output=True, text=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 # -------------------------
 # 路径与常量
@@ -40,6 +55,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 CONF_DIR = PROJECT_ROOT / "conf"
 DRIVER_PATH = PROJECT_ROOT / "driver" / "msedgedriver.exe"
 BROWSER_PATH_FILE = CONF_DIR / "browser.txt"
+TEMP_DIR = PROJECT_ROOT / "temp"
 
 PRODUCT_URL_FILE_PRI = CONF_DIR / "douyin" / "product-url.txt"
 PRODUCT_URL_FILE_FALLBACK = CONF_DIR / "product-url.txt"
@@ -79,6 +95,16 @@ X_EXISTING_SPEC_ITEMS = (
     "//span[contains(@class,'ecom-g-select-selection-item')]",
 )
 
+# - 规格值输入容器与输入框（元素示例/商品规格区域.html）
+SPEC_VALUE_CONTAINER_XPATH_TMPL = "//div[@id=concat('skuValue-', '{dim}')]"
+SPEC_VALUE_INPUT_XPATH_TMPL = ".//input[contains(@placeholder,'请输入') and contains(@placeholder, '{dim}') and @type='text']"
+
+# - 保存草稿按钮（元素示例/保存草稿按钮.html）
+X_SAVE_DRAFT_BUTTON = (
+    By.XPATH,
+    "//button[.//span[normalize-space(text())='保存草稿']]",
+)
+
 
 def read_browser_path() -> Optional[str]:
     """读取浏览器可执行文件路径（Edge）。
@@ -108,20 +134,16 @@ def read_product_url() -> str:
     raise RuntimeError("未找到商品链接，请在 conf/douyin/product-url.txt 或 conf/product-url.txt 填写链接")
 
 
-def read_spec_dimensions_from_yaml(yaml_path: Path) -> List[str]:
-    """最简 YAML 顶层键解析：提取作为“维度”的键名列表。
-    - 不依赖 PyYAML；仅处理类似如下结构：
-        颜色分类:
-          - A
-          - B
-        尺码:
-          - M
-          - L
-    - 只取顶层键名 [颜色分类, 尺码]
+def read_spec_dimensions_with_options(yaml_path: Path) -> dict:
+    """最简 YAML 解析：
+    - 解析顶层键为维度名；其下缩进行若以 "- " 开头则作为该维度的选项。
+    - 返回 { 维度: [选项1, 选项2, ...] } 的有序字典（按出现顺序）。
     """
     if not yaml_path.exists():
         raise RuntimeError(f"未找到规格配置文件: {yaml_path}")
-    dims: List[str] = []
+    from collections import OrderedDict
+    result = OrderedDict()
+    cur_key = None
     try:
         with yaml_path.open("r", encoding="utf-8") as f:
             for raw in f:
@@ -130,21 +152,28 @@ def read_spec_dimensions_from_yaml(yaml_path: Path) -> List[str]:
                     continue
                 if line.lstrip().startswith("#"):
                     continue
-                # 仅识别顶层（不以空格开头），并以冒号结尾
+                # 顶层键：不以空格开头且以冒号结尾
                 if not line.startswith(" ") and line.strip().endswith(":"):
-                    key = line.strip()[:-1].strip()
-                    if key:
-                        dims.append(key)
+                    cur_key = line.strip()[:-1].strip()
+                    if cur_key:
+                        result[cur_key] = []
+                    continue
+                # 子项：以连字符列表
+                if cur_key and line.lstrip().startswith("-"):
+                    # 允许任意缩进，但取"- "后的内容
+                    dash_idx = line.find("-")
+                    val = line[dash_idx + 1 :].strip()
+                    if val:
+                        result[cur_key].append(val)
     except Exception as e:
-        raise RuntimeError(f"解析规格配置失败，请检查 conf/规格.yml 格式是否为顶层键: 列表 的结构。错误: {e}")
-    if not dims:
-        raise RuntimeError("未从 conf/规格.yml 解析到任何维度，请确认顶层键是否存在")
-    print(f"[信息] 将要创建的规格维度: {dims}")
-    return dims
+        raise RuntimeError(f"解析规格配置失败，请检查 conf/规格.yml 是否为 顶层键: 列表 的结构。错误: {e}")
+    if not result:
+        raise RuntimeError("未从 conf/规格.yml 解析到任何维度，请确认内容格式")
+    print(f"[信息] 将要创建的规格维度: {list(result.keys())}")
+    return result
 
 
-def build_edge_driver() -> webdriver.Edge:
-    """构建 Edge WebDriver。优先使用本地 driver/msedgedriver.exe 与 conf/browser.txt。"""
+def _make_edge_options(user_data_dir: Optional[str], profile_dir: Optional[str], debugger_addr: Optional[str] = None) -> EdgeOptions:
     opts = EdgeOptions()
     opts.add_argument("start-maximized")
     # 部分稳定启动参数，减少首次启动与提示
@@ -152,6 +181,25 @@ def build_edge_driver() -> webdriver.Edge:
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--disable-popup-blocking")
     opts.add_argument("--remote-allow-origins=*")
+    if user_data_dir:
+        opts.add_argument(f"--user-data-dir={user_data_dir}")
+        if profile_dir:
+            opts.add_argument(f"--profile-directory={profile_dir}")
+    if debugger_addr:
+        opts.add_experimental_option("debuggerAddress", debugger_addr)
+    return opts
+
+
+def build_edge_driver() -> webdriver.Edge:
+    """构建 Edge WebDriver。优先使用本地 driver/msedgedriver.exe 与 conf/browser.txt。"""
+    # 先关闭所有已运行的 Edge，避免用户数据目录被占用导致启动崩溃
+    try:
+        print("[步骤] 正在关闭已运行的 Edge 进程…")
+        kill_edge_processes()
+        time.sleep(0.5)
+    except Exception:
+        pass
+    # 偏好复用用户数据目录
     # 复用本机 Edge 登录态（优先环境变量，其次本机默认路径）
     user_data_dir = os.environ.get("EDGE_USER_DATA_DIR")
     profile_dir = os.environ.get("EDGE_PROFILE", "Default")
@@ -161,10 +209,8 @@ def build_edge_driver() -> webdriver.Edge:
             default_ud = Path(lad) / "Microsoft" / "Edge" / "User Data"
             if default_ud.exists():
                 user_data_dir = str(default_ud)
+    opts = _make_edge_options(user_data_dir, profile_dir)
     if user_data_dir:
-        opts.add_argument(f"--user-data-dir={user_data_dir}")
-        if profile_dir:
-            opts.add_argument(f"--profile-directory={profile_dir}")
         print(f"[信息] 将复用 Edge 登录态：{user_data_dir} / {profile_dir}")
         print("[提示] 如 Edge 已经打开，可能因同一用户数据目录被占用而导致启动失败，请先关闭所有 Edge 窗口再运行；或改用“附加模式”（见 README）。")
     else:
@@ -177,7 +223,7 @@ def build_edge_driver() -> webdriver.Edge:
     if attach_addr:
         try:
             # 附加模式不需要 service
-            opts.add_experimental_option("debuggerAddress", attach_addr)
+            opts = _make_edge_options(None, None, attach_addr)
             print(f"[信息] 正在以附加模式连接到 Edge：{attach_addr}")
             driver = webdriver.Edge(options=opts)
             driver.implicitly_wait(2)
@@ -203,13 +249,24 @@ def build_edge_driver() -> webdriver.Edge:
             try:
                 start_edge_debug_and_wait(browser_path, user_data_dir, profile_dir, port, timeout=20)
                 # 以附加模式连接
-                opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-                drv = webdriver.Edge(options=opts)
+                opts2 = _make_edge_options(None, None, f"127.0.0.1:{port}")
+                drv = webdriver.Edge(options=opts2)
                 drv.implicitly_wait(2)
                 return drv
             except Exception as e2:
                 print(f"[错误] 自动启动并附加 Edge 失败：{e2}")
-                raise
+                # 最后回退：使用临时用户数据目录全新会话
+                try:
+                    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+                    tmp_ud = str(TEMP_DIR / "edge-user-data")
+                    print(f"[警告] 将回退为临时用户数据目录启动：{tmp_ud}")
+                    opts3 = _make_edge_options(tmp_ud, "Default")
+                    drv = webdriver.Edge(options=opts3)
+                    drv.implicitly_wait(2)
+                    return drv
+                except Exception as e3:
+                    print(f"[错误] 使用临时用户数据目录启动也失败：{e3}")
+                    raise
         else:
             raise e
 
@@ -329,6 +386,126 @@ def navigate_to_url(driver: webdriver.Edge, url: str, wait_seconds: int = 5) -> 
             except Exception as e2:
                 print(f"[错误] location.href 也失败：{e2}")
 
+
+def _find_spec_value_input(driver: webdriver.Edge, dim: str):
+    """根据维度名找到其“规格值输入框”。
+    优先选择“新增用”的空白输入框：位于 class 含 style_forCreate__tNN3f 的容器内，且 value 为空；
+    找不到则回退为容器内任意 placeholder 匹配的输入；再找不到则全局回退。
+    """
+    container_xpath = SPEC_VALUE_CONTAINER_XPATH_TMPL.format(dim=dim)
+    try:
+        container = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, container_xpath))
+        )
+        # 1) 优先：forCreate 容器下的空白输入
+        try:
+            return container.find_element(
+                By.XPATH,
+                ".//div[contains(@class,'style_skuValueInput__oQFaa') and contains(@class,'style_forCreate__tNN3f')]//input[contains(@placeholder,'请输入') and contains(@placeholder, '%s') and @type='text' and (not(@value) or @value='')]" % dim,
+            )
+        except Exception:
+            pass
+        # 2) 回退：容器内任意 placeholder 匹配的输入（可能已有值）
+        try:
+            return container.find_element(
+                By.XPATH,
+                ".//input[contains(@placeholder,'请输入') and contains(@placeholder, '%s') and @type='text']" % dim,
+            )
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # 3) 全局回退：任意匹配 placeholder 的空白输入
+    try:
+        return WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, f"//input[contains(@placeholder,'{dim}') and contains(@placeholder,'请输入') and @type='text' and (not(@value) or @value='')]"))
+        )
+    except Exception:
+        # 4) 最后全局任意匹配
+        try:
+            return WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.XPATH, f"//input[contains(@placeholder,'{dim}') and contains(@placeholder,'请输入') and @type='text']"))
+            )
+        except Exception:
+            return None
+
+
+def input_options_for_dimension(driver: webdriver.Edge, dim: str, options: List[str]) -> None:
+    """在给定维度的输入框中，依次输入选项并回车。"""
+    if not options:
+        print(f"[信息] 维度“{dim}”未配置任何选项，跳过输入")
+        return
+    for val in options:
+        # 若该选项已存在则跳过（幂等）
+        if _option_exists_in_dimension(driver, dim, val):
+            print(f"[跳过] 维度“{dim}”已存在选项：{val}")
+            continue
+        ok = False
+        for attempt in range(3):
+            try:
+                inp = _find_spec_value_input(driver, dim)
+                if not inp:
+                    print(f"[错误] 未找到维度“{dim}”的输入框，终止该维度的选项录入")
+                    break
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", inp)
+                inp.clear()
+                inp.send_keys(val)
+                inp.send_keys(Keys.ENTER)
+                # 等待该选项出现在页面
+                try:
+                    WebDriverWait(driver, 5).until(lambda d: _option_exists_in_dimension(d, dim, val))
+                    print(f"[步骤] 维度“{dim}”已添加选项：{val}")
+                    ok = True
+                    break
+                except Exception:
+                    time.sleep(0.2)
+            except (StaleElementReferenceException, WebDriverException):
+                time.sleep(0.2)
+                continue
+            except Exception as e:
+                print(f"[警告] 输入选项失败（维度={dim}，选项={val}）：{e}")
+                break
+        if not ok:
+            print(f"[警告] 未能确认选项已添加（维度={dim}，选项={val}），可能页面结构变化或网络因素")
+
+def _get_spec_container(driver: webdriver.Edge, dim: str):
+    container_xpath = SPEC_VALUE_CONTAINER_XPATH_TMPL.format(dim=dim)
+    try:
+        return WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, container_xpath))
+        )
+    except Exception:
+        return None
+
+
+def _option_exists_in_dimension(driver: webdriver.Edge, dim: str, val: str) -> bool:
+    """判断维度容器下是否已存在某个选项标签/文本。"""
+    container = _get_spec_container(driver, dim)
+    if not container:
+        return False
+    try:
+        # 方案A：在该维度容器内查找任意文本等于 val 的元素
+        nodes_text = container.find_elements(By.XPATH, f".//*[normalize-space(text())='{val}']")
+        if len(nodes_text) > 0:
+            return True
+        # 方案B：有些结构中，选项以 input 的 value 形式存在（旁有删除图标）
+        nodes_input = container.find_elements(By.XPATH, f".//input[@type='text' and @value='{val}']")
+        if len(nodes_input) > 0:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def click_save_draft(driver: webdriver.Edge) -> None:
+    """点击“保存草稿”按钮。"""
+    try:
+        btn = WebDriverWait(driver, 20).until(EC.element_to_be_clickable(X_SAVE_DRAFT_BUTTON))
+        btn.click()
+        print("[步骤] 已点击“保存草稿”按钮")
+    except Exception as e:
+        print(f"[错误] 未能点击“保存草稿”按钮：{e}")
+
 def collect_existing_dimensions(driver: webdriver.Edge) -> Set[str]:
     """收集页面中已存在的维度名（从已选择项的展示中提取文本）。"""
     existed: Set[str] = set()
@@ -403,10 +580,11 @@ def create_dimension_via_dialog(driver: webdriver.Edge, dim: str) -> None:
 
 @task
 def create_douyin_spec_dimensions() -> None:
-    """创建抖店商品规格维度（仅维度，不创建选项）。"""
+    """创建抖店商品规格维度，并录入每个维度的所有选项，最后保存草稿。"""
     print("[开始] 抖店-创建规格维度 任务启动…")
     url = read_product_url()
-    dims = read_spec_dimensions_from_yaml(SPECS_YAML_FILE)
+    dims_map = read_spec_dimensions_with_options(SPECS_YAML_FILE)
+    dims = list(dims_map.keys())
 
     driver = build_edge_driver()
     try:
@@ -417,19 +595,26 @@ def create_douyin_spec_dimensions() -> None:
         existed = collect_existing_dimensions(driver)
 
         for dim in dims:
-            if dim in existed:
-                print(f"[跳过] 维度已存在：{dim}")
-                continue
-            # 依次添加
-            click_add_spec_button(driver)
-            open_latest_spec_dropdown(driver)
-            if not select_dimension_from_dropdown(driver, dim):
-                create_dimension_via_dialog(driver, dim)
-            # 更新已存在集合
-            time.sleep(0.5)
-            existed = collect_existing_dimensions(driver)
+            if dim not in existed:
+                # 先创建维度
+                click_add_spec_button(driver)
+                open_latest_spec_dropdown(driver)
+                if not select_dimension_from_dropdown(driver, dim):
+                    create_dimension_via_dialog(driver, dim)
+                # 更新已存在集合
+                time.sleep(0.5)
+                existed = collect_existing_dimensions(driver)
+            else:
+                print(f"[信息] 维度已存在：{dim}，将直接录入选项")
+            # 无论此前是否存在，均录入该维度的所有选项
+            try:
+                input_options_for_dimension(driver, dim, dims_map.get(dim, []))
+            except Exception as e:
+                print(f"[警告] 录入维度选项发生异常（维度={dim}）：{e}")
 
-        print("[完成] 规格维度创建流程结束。")
+        # 保存草稿
+        click_save_draft(driver)
+        print("[完成] 规格维度与选项录入并已尝试保存草稿。")
     finally:
         # 为便于人工检查，保留窗口 3 秒，可视需要调整
         time.sleep(3)
