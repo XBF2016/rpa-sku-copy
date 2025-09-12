@@ -1,6 +1,8 @@
 tasks:
   Traverse All SKU Combinations:
-    shell: python -m robocorp.tasks run ../main.py -t traverse_all_sku_combinations
+    shell: python -m robocorp.tasks run ../main.py 
+  Create Douyin Spec Dimensions:
+    shell: python -m robocorp.tasks run ../main.py -t create_douyin_spec_dimensions
 
 condaConfigFile: conda.yaml
 artifactsDir: ../output
