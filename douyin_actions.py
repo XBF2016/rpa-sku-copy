@@ -328,6 +328,66 @@ X_SKU_TABLE_VIRTUAL_BODY = (
 )
 
 
+def _lock_page_scroll(driver, body_el) -> None:
+    """在价格填充期间锁定页面与表格滚动，避免人工滚动导致错位。"""
+    try:
+        driver.execute_script(
+            """
+            (function(body){
+                try {
+                    if (window.__rpaScrollLock && window.__rpaScrollLock.id) {
+                        clearInterval(window.__rpaScrollLock.id);
+                    }
+                    var docBody = document.body;
+                    var html = document.documentElement;
+                    var origOverflow = docBody.style.overflow;
+                    var origPageYOffset = (window.pageYOffset || html.scrollTop || docBody.scrollTop || 0);
+                    var origBodyScroll = body ? body.scrollTop : 0;
+                    window.__rpaScrollLock = {origOverflow: origOverflow, origPageYOffset: origPageYOffset, origBodyScroll: origBodyScroll};
+                    docBody.style.overflow = 'hidden';
+                    window.__rpaScrollLock.id = setInterval(function(){
+                        try {
+                            if ((window.pageYOffset || html.scrollTop || docBody.scrollTop || 0) !== window.__rpaScrollLock.origPageYOffset) {
+                                window.scrollTo(0, window.__rpaScrollLock.origPageYOffset);
+                            }
+                            if (body && body.scrollTop !== window.__rpaScrollLock.origBodyScroll) {
+                                body.scrollTop = window.__rpaScrollLock.origBodyScroll;
+                            }
+                        } catch(e){}
+                    }, 50);
+                } catch(e){}
+            })(arguments[0]);
+            """,
+            body_el,
+        )
+    except Exception:
+        pass
+
+
+def _unlock_page_scroll(driver) -> None:
+    """解除滚动锁定并恢复样式。"""
+    try:
+        driver.execute_script(
+            """
+            (function(){
+                try {
+                    var docBody = document.body;
+                    if (window.__rpaScrollLock) {
+                        var lock = window.__rpaScrollLock;
+                        if (lock.id) { clearInterval(lock.id); }
+                        if (typeof lock.origOverflow !== 'undefined') {
+                            docBody.style.overflow = lock.origOverflow || '';
+                        }
+                    }
+                    window.__rpaScrollLock = null;
+                } catch(e){}
+            })();
+            """
+        )
+    except Exception:
+        pass
+
+
 def _find_price_inputs(driver):
     """查找当前可见的所有 SKU 价格输入框（不滚动）。
     限定范围：虚拟表格体内、非 extra 行、价格列中的 ecom-g-input-number-input。
@@ -387,12 +447,55 @@ def _normalize_price_text(price: float) -> str:
         return ""
 
 
+def _batch_set_inputs_via_js(driver, inputs, values) -> int:
+    """使用一次脚本调用，为同屏多个输入框批量赋值并触发事件。
+
+    返回成功尝试写入的数量（不保证页面最终接收）。
+    """
+    if not inputs:
+        return 0
+    try:
+        script = """
+        (function(inputs, values){
+            var changed = 0;
+            var setter;
+            try {
+                setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            } catch(e) { setter = null; }
+            for (var i = 0; i < inputs.length && i < values.length; i++) {
+                var el = inputs[i];
+                var txt = values[i];
+                if (!el || !txt) { continue; }
+                try {
+                    el.focus();
+                    var str = String(txt);
+                    if (el.value !== str) {
+                        if (setter) { setter.call(el, str); } else { el.value = str; }
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        try {
+                            el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+                            el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+                        } catch(e){}
+                        try { el.blur(); } catch(e){}
+                        try { el.dispatchEvent(new Event('blur', { bubbles: true })); } catch(e){}
+                    }
+                    changed++;
+                } catch(e) { /* 忽略单项异常，继续 */ }
+            }
+            return changed;
+        })(arguments[0], arguments[1]);
+        """
+        return int(driver.execute_script(script, inputs, values) or 0)
+    except Exception:
+        return 0
+
+
 def fill_prices_for_sku_table(driver, prices: List[float]) -> None:
-    """为 SKU 表格的价格列依次填写价格：
+    """为 SKU 表格的价格列依次填写价格（批量注入 + 虚拟滚动）：
     - 严格顺序：第 N 个输入框对应第 N 条价格；
-    - 幂等：若输入框已有 >0 的值，则跳过不覆盖；
-    - 价格为空或 <0.01 时跳过；
-    - 表格为虚拟滚动：逐批填写并滚动加载下一批。
+    - 全量覆盖：对有效价格（>=0.01）进行写入；无效价格跳过不清空；
+    - 表格为虚拟滚动：同屏批量注入后滚动加载下一屏。
     """
     if not prices:
         print("[提示] 未解析到任何价格数据（或 combos 为空），跳过价格填充")
@@ -403,7 +506,7 @@ def fill_prices_for_sku_table(driver, prices: List[float]) -> None:
         print("[提示] 未找到 SKU 表格区域，价格填充将被跳过")
         return
 
-    # 统一将页面与虚拟体滚到顶部，确保从第一个输入框开始对齐
+    # 统一将页面与虚拟体滚到顶部，确保从第一个输入框开始对齐，并锁定滚动避免人工打断
     try:
         driver.execute_script("window.scrollTo(0, 0);")
     except Exception:
@@ -412,110 +515,110 @@ def fill_prices_for_sku_table(driver, prices: List[float]) -> None:
         driver.execute_script("arguments[0].scrollTop = 0;", body)
     except Exception:
         pass
+    _lock_page_scroll(driver, body)
 
     idx = 0  # 已处理到的价格计划索引
     processed_rows = set()  # 已处理行 key，避免重复写同一行
+    processed_element_ids = set()  # 已处理的输入框元素唯一ID，避免同屏多轮重复
     stagnant_rounds = 0
     MAX_STAGNANT_ROUNDS = 8
+    PASSES_PER_SCREEN = 3  # 每屏尝试注入的轮数（>1 可覆盖屏底新增渲染的行）
+    PRE_SCROLL_STEP = 320   # 屏内小步滚动像素，用于触发更多行渲染
 
-    while idx < len(prices):
-        entries = _find_price_entries(driver)
-        if not entries:
-            stagnant_rounds += 1
-            if stagnant_rounds >= MAX_STAGNANT_ROUNDS:
-                break
-            time.sleep(0.2)
-            continue
-
-        stagnant_rounds = 0
-        made_progress = False
-        for inp, row_key in entries:
-            if row_key and row_key in processed_rows:
+    try:
+        while idx < len(prices):
+            entries = _find_price_entries(driver)
+            if not entries:
+                stagnant_rounds += 1
+                if stagnant_rounds >= MAX_STAGNANT_ROUNDS:
+                    break
+                time.sleep(0.2)
                 continue
-            if idx >= len(prices):
-                break
-            price = prices[idx]
-            idx += 1
-            try:
-                txt = _normalize_price_text(float(price)) if price is not None else ""
-                # 无论是否需要填写（null/无效），均视为该行已处理，避免再次覆盖/错位
-                if row_key:
-                    processed_rows.add(row_key)
-                if not txt:
-                    made_progress = True
-                    continue
 
-                try:
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
-                except Exception:
-                    pass
-                try:
-                    inp.click()
-                except Exception:
+            stagnant_rounds = 0
+            made_progress = False
+
+            # 屏内多轮注入：覆盖底部刚渲染出来的新行
+            for pass_idx in range(PASSES_PER_SCREEN):
+                entries_cur = entries if pass_idx == 0 else _find_price_entries(driver)
+                if not entries_cur:
+                    break
+
+                batch_inputs = []
+                batch_values = []
+                consumed = 0
+                for inp, row_key in entries_cur:
+                    # 依据行 key 与元素 id 双重去重，避免重复处理
+                    if row_key and row_key in processed_rows:
+                        continue
                     try:
-                        driver.execute_script("arguments[0].click();", inp)
+                        el_id = getattr(inp, "id", None) or ""
+                    except Exception:
+                        el_id = ""
+                    if el_id and el_id in processed_element_ids:
+                        continue
+                    if idx >= len(prices):
+                        break
+                    price = prices[idx]
+                    idx += 1
+                    consumed += 1
+                    try:
+                        txt = _normalize_price_text(float(price)) if price is not None else ""
+                    except Exception:
+                        txt = ""
+                    # 标记该行已处理（无论是否写入有效值），避免后续重复
+                    if row_key:
+                        processed_rows.add(row_key)
+                    if el_id:
+                        processed_element_ids.add(el_id)
+                    # 收集批量写入项（仅对有值的进行写入；无效值跳过不清空）
+                    if txt:
+                        batch_inputs.append(inp)
+                        batch_values.append(txt)
+
+                if consumed > 0:
+                    made_progress = True
+                if batch_inputs:
+                    try:
+                        _batch_set_inputs_via_js(driver, batch_inputs, batch_values)
                     except Exception:
                         pass
-                try:
-                    inp.send_keys(Keys.CONTROL, "a")
-                except Exception:
+
+                # 非最后一轮，则进行一次小步滚动以加载更多行，再次批量注入
+                if pass_idx < PASSES_PER_SCREEN - 1:
                     try:
-                        inp.clear()
+                        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + arguments[1];", body, PRE_SCROLL_STEP)
                     except Exception:
-                        pass
-                inp.send_keys(txt)
-                time.sleep(0.03)
-                try:
-                    inp.send_keys(Keys.ENTER)
-                except Exception:
-                    pass
-                # 简单校验，若值不一致，重试一次
-                try:
-                    after = (inp.get_attribute("value") or "").strip()
-                    if after and after != txt:
                         try:
-                            inp.send_keys(Keys.CONTROL, "a")
-                        except Exception:
-                            try:
-                                inp.clear()
-                            except Exception:
-                                pass
-                        inp.send_keys(txt)
-                        time.sleep(0.03)
-                        try:
-                            inp.send_keys(Keys.ENTER)
+                            driver.execute_script("window.scrollBy(0, arguments[0]);", PRE_SCROLL_STEP)
                         except Exception:
                             pass
-                except Exception:
-                    pass
-                made_progress = True
-            except StaleElementReferenceException:
-                continue
-            except Exception as e:
-                print(f"[警告] 写入价格失败（索引={idx-1}，价格={price}）：{e}")
+                    time.sleep(0.05)
 
-        # 滚动以触发后续行渲染
-        try:
-            entries2 = _find_price_entries(driver)
-            if entries2:
-                try:
-                    driver.execute_script("arguments[0].scrollIntoView({block:'end'});", entries2[-1][0])
-                except Exception:
+            # 滚动以触发后续行渲染
+            try:
+                entries2 = _find_price_entries(driver)
+                if entries2:
                     try:
-                        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + 600;", body)
+                        driver.execute_script("arguments[0].scrollIntoView({block:'end'});", entries2[-1][0])
                     except Exception:
-                        pass
-            if not made_progress:
-                try:
-                    driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + 1000;", body)
-                except Exception:
+                        try:
+                            driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + 600;", body)
+                        except Exception:
+                            pass
+                if not made_progress:
                     try:
-                        driver.execute_script("window.scrollBy(0, 800);")
+                        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + 1000;", body)
                     except Exception:
-                        pass
-        except Exception:
-            pass
-        time.sleep(0.1)
+                        try:
+                            driver.execute_script("window.scrollBy(0, 800);")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            time.sleep(0.05)
+    finally:
+        _unlock_page_scroll(driver)
 
     print(f"[信息] 价格填充完成（计划条数={len(prices)}，已处理到索引={idx}）")
 

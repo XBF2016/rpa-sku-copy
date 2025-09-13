@@ -1,7 +1,7 @@
 ## 登录态复用（避免“登录过期”）
 - 程序在启动 Edge 时会尽量复用本机已登录的浏览器用户数据目录，避免出现“登录过期”。
 - 默认策略：
-  - 若未设置环境变量，会自动尝试使用 `%LOCALAPPDATA%\\Microsoft\\Edge\\User Data` 作为 `--user-data-dir`，并使用 `--profile-directory=Default`。
+  - 若未设置环境变量，会自动尝试使用 `%LOCALAPPDATA%\Microsoft\Edge\User Data` 作为 `--user-data-dir`，并使用 `--profile-directory=Default`。
   - 若你平时登录抖店使用的不是 `Default` 配置（例如 `Profile 1`/`Profile 2`），请在运行前显式设置：
 
   ```powershell
@@ -27,7 +27,7 @@
 - `config.py`：路径常量与配置读取（浏览器路径、商品链接、规格最简解析：支持从 output/<子目录>/result.yml 的 specs 读取）
 - `driver_utils.py`：浏览器启动与稳健导航、登录等待等通用流程
 - `douyin_actions.py`：抖店页面元素与动作（创建维度、录入选项、保存草稿等）
-- `conf/browser.txt`：Edge 浏览器可执行文件路径（例如：`C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe`）
+- `conf/browser.txt`：Edge 浏览器可执行文件路径（例如：`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`）
 - `conf/product-url.txt`：商品上架草稿页链接（若 `conf/douyin/product-url.txt` 不存在，则回退使用本文件）
 - `conf/douyin/product-url.txt`：商品上架草稿页链接（优先读取）
 - `conf/规格.yml`：规格配置文件，仅使用其“顶层键名”作为需要创建的维度列表
@@ -102,6 +102,14 @@ combos:
 - “保存草稿”按钮：参考 `元素示例/保存草稿按钮.html`，通过按钮文案“保存草稿”定位。
  - “SKU表格与价格输入框”：参考 `元素示例/sku表格区域.html` 与 `元素示例/sku价格输入框.html`，在虚拟表格 `ecom-g-table-tbody-virtual ecom-g-table-tbody` 容器内，按行查找 `attr-column-field_price` 列下的 `input.ecom-g-input-number-input` 输入框，依次输入价格。
 
+### 价格填写方式（批量注入 + 自动滚动）
+- 本项目已将价格填写优化为“每屏批量注入 + 多轮小步滚动”：
+  - 同屏收集所有价格输入框，一次性通过脚本批量赋值并触发 input/change/blur/Enter 等常见事件；
+  - 每屏执行 3 轮“小步滚动 + 批量注入”，确保屏幕底部刚渲染出来的新行也能被覆盖；
+  - 仍遵循“全量覆盖模式”：对有效价格（≥0.01）会覆盖填写；对 `null` 或小于 0.01 的价格将跳过不填；
+  - 元素去重：基于行 key 与元素 id 双重去重，避免多轮注入造成重复消耗价格；
+  - 表格定位严格遵循“元素示例”中的结构与类名，不硬编码不可靠后缀。
+
 ## 运行日志与幂等
 - 程序会在开始时打印将要创建的维度列表；每一步操作均有中文提示。
 - 对已存在的维度会自动跳过，避免重复创建（幂等）。
@@ -118,6 +126,7 @@ combos:
 ## 性能与速度
 - 规格选项录入采用“极速批量输入”模式：先在“新增用输入框”快速连输（每项仅约 20~30ms 极短等待），一轮结束后统一校验缺失项并补录一次，显著减少每项的等待时间。
 - 若你的页面网络或设备较慢，导致个别选项首次未识别，也会在补录阶段自动补齐；如仍有漏项，可再次运行任务，程序会幂等跳过已存在内容，仅补缺。
+ - 价格填写采用“每屏批量注入 + 多轮小步滚动”模式：相比逐个 `send_keys`，显著降低交互次数，加快整体填充速度；并在每次写入后触发必要事件，确保页面产生预期的校验与联动。
 
 ## 注意事项
 - 首次运行可能需要登录抖店后台：程序会在未检测到“添加规格类型”按钮时提示等待登录，然后继续。
