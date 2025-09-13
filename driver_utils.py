@@ -234,6 +234,24 @@ def wait_for_login_and_page_ready(driver: webdriver.Edge, timeout: int = 60, max
         try:
             WebDriverWait(driver, timeout).until(EC.presence_of_element_located(X_ADD_SPEC_BUTTON))
             print("[信息] 页面已加载，检测到“添加规格类型”按钮")
+            # 页面就绪后，提前滚动到“添加规格类型”按钮附近，便于后续操作区域可视
+            try:
+                btn = driver.find_element(*X_ADD_SPEC_BUTTON)
+                driver.execute_script(
+                    """
+                    (function(el){
+                        try {
+                            var rect = el.getBoundingClientRect();
+                            var top = rect.top + (window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0) - 140;
+                            if (top < 0) top = 0;
+                            window.scrollTo(0, top);
+                        } catch(e) { try { el.scrollIntoView({block:'center'}); } catch(e2) {} }
+                    })(arguments[0]);
+                    """,
+                    btn,
+                )
+            except Exception:
+                pass
             return
         except Exception:
             if not has_prompted:

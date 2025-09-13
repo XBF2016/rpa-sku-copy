@@ -22,6 +22,39 @@ from selenium.common.exceptions import StaleElementReferenceException, WebDriver
 
 
 # -------------------------
+# 页面滚动/聚焦小工具
+# -------------------------
+def _pre_scroll_element(driver, el, top_margin: int = 120) -> None:
+    """将页面滚动到使元素位于视口上方留出一定空白（默认 120px）。
+
+    - 优先使用绝对定位滚动，降级使用 scrollIntoView 居中。
+    - 仅滚动页面，不更改任意样式，避免影响后续交互。
+    """
+    try:
+        driver.execute_script(
+            """
+            (function(el, margin){
+                try {
+                    var rect = el.getBoundingClientRect();
+                    var top = rect.top + (window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0) - (margin || 120);
+                    if (top < 0) top = 0;
+                    window.scrollTo(0, top);
+                } catch(e) {
+                    try { el.scrollIntoView({block:'center'}); } catch(e2) {}
+                }
+            })(arguments[0], arguments[1]);
+            """,
+            el,
+            int(top_margin),
+        )
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+        except Exception:
+            pass
+
+
+# -------------------------
 # 元素选择器（严格参考 元素示例/ 下的文件）
 # -------------------------
 # - 添加规格类型 按钮（元素示例/添加规格类型.html）
@@ -156,7 +189,14 @@ def create_dimension_via_dialog(driver, dim: str) -> None:
 def click_save_draft(driver) -> None:
     try:
         btn = WebDriverWait(driver, 20).until(EC.element_to_be_clickable(X_SAVE_DRAFT_BUTTON))
-        btn.click()
+        try:
+            _pre_scroll_element(driver, btn, top_margin=140)
+        except Exception:
+            pass
+        try:
+            btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn)
         print("[步骤] 已点击“保存草稿”按钮")
     except Exception as e:
         print(f"[错误] 未能点击“保存草稿”按钮：{e}")
@@ -268,6 +308,14 @@ def input_options_for_dimension(driver, dim: str, options: List[str]) -> None:
     if not options:
         print(f"[信息] 维度“{dim}”未配置任何选项，跳过输入")
         return
+
+    # 在开始对某个维度进行操作前，先将屏幕滚动到该维度区域附近，避免“看不见就操作”的体验
+    try:
+        container_for_scroll = _get_spec_container(driver, dim)
+        if container_for_scroll is not None:
+            _pre_scroll_element(driver, container_for_scroll, top_margin=120)
+    except Exception:
+        pass
 
     existing_set = _list_existing_options_set(driver, dim)
     pending = [v for v in options if v not in existing_set]
