@@ -720,3 +720,58 @@ def export_results_to_yaml(sku_dimensions, results: List[List[str]], headers: Li
     except Exception:
         pass
     return file_path
+
+
+def download_product_main_images(urls: List[str], out_dir: Path) -> int:
+    """下载商品主图画廊图片到 out_dir，文件命名为：商品主图-序号.png（1 起）。
+    若文件已存在则跳过。返回成功下载数量。
+    """
+    count = 0
+    if not urls:
+        return 0
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for i, u in enumerate(urls, start=1):
+        try:
+            if not (isinstance(u, str) and (u.startswith("http://") or u.startswith("https://"))):
+                continue
+            fname = f"商品主图-{i}.png"
+            target = out_dir / fname
+            if target.exists():
+                continue
+            if requests is None:
+                continue
+            req_headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
+                ),
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Referer": f"{urlparse(u).scheme}://{urlparse(u).hostname}/",
+                "Connection": "keep-alive",
+            }
+            resp = requests.get(u, headers=req_headers, timeout=20)
+            resp.raise_for_status()
+            if _HAS_PILLOW:
+                from io import BytesIO
+                bio = BytesIO(resp.content)
+                pil_img = PILImage.open(bio)
+                if pil_img.mode not in ("RGB", "RGBA"):
+                    pil_img = pil_img.convert("RGB")
+                pil_img.save(target, format="PNG")
+            else:
+                with open(target, 'wb') as fbin:
+                    fbin.write(resp.content)
+            count += 1
+        except Exception:
+            continue
+    try:
+        if count:
+            print(f"[步骤] 已下载商品主图 {count} 张到: {out_dir}")
+    except Exception:
+        pass
+    try:
+        append_to_log(f"下载商品主图完成：{count} 张，目录 {out_dir}")
+    except Exception:
+        pass
+    return count

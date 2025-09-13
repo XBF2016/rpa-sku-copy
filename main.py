@@ -26,6 +26,8 @@ from traversal import (
     traverse_and_collect,
 )
 from io_utils import export_results_to_excel, export_results_to_yaml
+from sku_utils import collect_main_gallery_image_urls
+from io_utils import download_product_main_images
 
 
 @task
@@ -69,6 +71,36 @@ def traverse_all_sku_combinations():
         combinations, last_selected_vids = reorder_with_current_selected(driver, sku_dimensions, combinations)
         combinations = apply_max_combos_limit(combinations)
 
+        # 在正式遍历规格前，先创建输出目录并下载商品主图画廊
+        # 根据“店铺名+商品名”建立子目录
+        def _safe_name(n: str) -> str:
+            try:
+                s = str(n)
+            except Exception:
+                s = ""
+            s = re.sub(r"[\\/:*?\"<>|]+", " ", s)
+            s = re.sub(r"\s+", " ", s).strip()
+            return (s[:80] if s else "未命名")
+
+        folder_name = f"[{_safe_name(shop_name)}]{_safe_name(product_name)}"
+        artifacts_env = os.environ.get("ROBOT_ARTIFACTS", "").strip()
+        if artifacts_env:
+            base_output = Path(artifacts_env)
+        else:
+            base_output = Path(__file__).resolve().parent / "output"
+        output_dir = base_output / folder_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            gallery_urls = collect_main_gallery_image_urls(driver)
+        except Exception:
+            gallery_urls = []
+        try:
+            if gallery_urls:
+                download_product_main_images(gallery_urls, output_dir)
+        except Exception:
+            pass
+
         print("[步骤] 开始遍历所有SKU组合...")
 
         # 遍历并收集
@@ -85,26 +117,6 @@ def traverse_all_sku_combinations():
         # 导出结果到 Excel（包含表头）：各维度 + 价格（不包含图片相关列）
         headers = [dim.name for dim in sku_dimensions] + ["价格"]
 
-        # 根据“店铺名+商品名”建立子目录
-        def _safe_name(n: str) -> str:
-            try:
-                s = str(n)
-            except Exception:
-                s = ""
-            s = re.sub(r"[\\/:*?\"<>|]+", " ", s)
-            s = re.sub(r"\s+", " ", s).strip()
-            return (s[:80] if s else "未命名")
-
-        folder_name = f"[{_safe_name(shop_name)}]{_safe_name(product_name)}"
-        # 优先使用 Robocorp 运行时提供的输出目录（由 robot.yaml 的 artifactsDir 传入）
-        artifacts_env = os.environ.get("ROBOT_ARTIFACTS", "").strip()
-        if artifacts_env:
-            base_output = Path(artifacts_env)
-        else:
-            # 兼容直接本地运行（未通过 rcc/robot.yaml 时）
-            base_output = Path(__file__).resolve().parent / "output"
-        output_dir = base_output / folder_name
-        output_dir.mkdir(parents=True, exist_ok=True)
         excel_path = output_dir / "result.xlsx"
         yaml_path = output_dir / "result.yml"
         try:

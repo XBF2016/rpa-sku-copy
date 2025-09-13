@@ -392,6 +392,97 @@ def get_main_image_url(driver) -> str:
     return last if (last.startswith("http://") or last.startswith("https://")) else ""
 
 
+def collect_main_gallery_image_urls(driver, max_items: int | None = None) -> List[str]:
+    """采集商品进入详情页时“主图画廊”的所有主图大图链接。
+    实现策略：
+      - 定位缩略图区域（包含匹配，以适配哈希类名变动）：`[class*='thumbnailsWrap']`
+      - 逐个点击缩略图项（优先点击其 `thumbnailItem` 容器），每次点击后读取 `get_main_image_url()` 返回的主图大图 URL；
+      - 按首次出现顺序去重，返回列表；
+      - 若未找到缩略图区域，则至少返回当前主图区域图片（若可取到）。
+    """
+    urls: List[str] = []
+    seen: set[str] = set()
+
+    # 保底：先尝试取当前展示的大图
+    try:
+        cur = get_main_image_url(driver)
+        if cur and cur not in seen:
+            seen.add(cur)
+            urls.append(cur)
+    except Exception:
+        pass
+
+    try:
+        # 将缩略图区域滚动到可视范围
+        try:
+            driver.execute_script(
+                "try{var w=document.querySelector(\"[class*='thumbnailsWrap']\"); if(w){w.scrollIntoView({block:'center',inline:'center'});} }catch(e){}"
+            )
+        except Exception:
+            pass
+
+        thumb_item_sel = "[class*='thumbnailsWrap'] [class*='thumbnailItem']"
+
+        # 获取所有缩略图项的数量（动态元素，后续每次点击前重取避免陈旧引用）
+        items = driver.find_elements(By.CSS_SELECTOR, thumb_item_sel)
+        total = len(items)
+        if max_items is not None:
+            total = min(total, max(0, int(max_items)))
+
+        last_url = urls[-1] if urls else ""
+        for idx in range(total):
+            try:
+                # 每次循环重新定位，规避 StaleElementReferenceException
+                items_now = driver.find_elements(By.CSS_SELECTOR, thumb_item_sel)
+                if idx >= len(items_now):
+                    break
+                item = items_now[idx]
+                try:
+                    # 跳过非图片型缩略（如“参数”）
+                    _ = item.find_element(By.CSS_SELECTOR, "img")
+                except Exception:
+                    continue
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", item)
+                except Exception:
+                    pass
+                try:
+                    driver.execute_script("arguments[0].click();", item)
+                except Exception:
+                    try:
+                        item.click()
+                    except Exception:
+                        continue
+
+                # 等待主图 URL 切换并稳定
+                t_end = time.perf_counter() + 1.0
+                picked = ""
+                while time.perf_counter() < t_end:
+                    try:
+                        u = get_main_image_url(driver)
+                    except Exception:
+                        u = ""
+                    if u and u != last_url:
+                        picked = u
+                        break
+                    time.sleep(0.05)
+                if not picked:
+                    try:
+                        picked = get_main_image_url(driver)
+                    except Exception:
+                        picked = ""
+                if picked and picked not in seen:
+                    seen.add(picked)
+                    urls.append(picked)
+                    last_url = picked
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return urls
+
+
 def _get_text_by_selector(driver, selector: str) -> str:
     """通用：获取单个元素的文本（优先 title，其次 textContent）。失败返回空串。"""
     js = (
