@@ -9,7 +9,7 @@
 - `browser_utils.py`：浏览器/Driver 管理（清理进程、查找本地 `msedgedriver.exe`、初始化 WebDriver、打开页面）。
 - `sku_utils.py`：页面选择器常量、SKU 数据模型、SKU 解析、取价、维度概要与结构日志输出。
 - `traversal.py`：遍历相关逻辑（生成组合、首选当前选择、限制数量、点击选择、遍历收集）。
-- `io_utils.py`：导出 Excel（图片去重下载、统一转 PNG，并通过 Excel COM 以“链接的图片”方式显示）。
+- `io_utils.py`：导出 Excel（仅维度与价格；Excel 不含图片列），并在导出 YAML 时收集并下载规格图。
 - `conf/`：所有配置文件目录（`conda.yaml`、`robot.yaml`、`product-url.txt`、`browser.txt`）。
 - `driver/`：浏览器驱动目录（`msedgedriver.exe`）。
 - `output/`：导出结果目录（Excel）。
@@ -27,7 +27,7 @@
   - `PATH: ['..']`，`PYTHONPATH: ['..']`
 - `conda.yaml`：Python 环境依赖（包含 robocorp-tasks、selenium、openpyxl 等）。
   - 依赖精简：移除 `webdriver-manager`（不再联网下载驱动），通过本地路径自动查找 `msedgedriver.exe`（见 `browser_utils.find_msedgedriver_path()`）。
-  - 需要 `pillow`（图片转 PNG）与 `pywin32`（通过 Excel COM 插入“链接的图片”）。
+  - 不再需要 `pywin32`（Excel 不再插图）。`pillow` 可选：用于将下载的规格图规范为 PNG；若未安装，则会按原始字节落盘（后缀仍为 PNG）。
 
 ## 浏览器驱动（driver/）
 - 将 `msedgedriver.exe` 放置到 `driver/` 目录（默认优先查找此处）。
@@ -73,17 +73,12 @@ $env:MAX_COMBOS=5; rcc run -r conf\robot.yaml
 - 控制台/日志统一中文输出；价格文本统一替换 `¥` 为 `￥` 以避免 GBK 编码问题。
 - 可通过环境变量 `DEBUG_RPA=1` 打开调试日志；`MAX_COMBOS=N` 可限制前 N 个组合用于快速验证。
 - 导出的 Excel：
-  - 新增“图片”与“图片链接”两列（均位于“价格”之前）。
-    - “图片”列：对图片链接去重后，仅下载一次并统一转为 PNG 到与 `result.xlsx` 同级目录；导出后使用 Excel COM 在单元格内插入“链接的图片”（LinkToFile=True, SaveWithDocument=False），按列宽等比缩放（默认预览宽度约 60px，在 `io_utils.py` 中可调），并调整行高展示缩略图。该方式不会把图片数据存入工作簿，Excel 体积很小。
-      - 作为兜底，“图片”列单元格中也会写入一个可点击的“查看图片”超链接，便于在 COM 不可用或图片未能加载时直接打开原始 URL。
-      - 命名规则：`img_<图片URL的MD5前10位>.png`。
-      - 若下载/转换失败或系统无法使用 COM，则退化为写入指向原始 URL 的超链接（此时不显示缩略图）。
-    - “图片链接”列：保留原始图片 URL（默认列宽较宽 90，便于复制）。
+  - 仅包含“各维度列 + 价格”两部分，已移除“图片/图片链接”相关列与处理（但程序仍会在 YAML 导出阶段收集规格图）。
   - 全表样式：所有单元格均设置为“水平居中 + 垂直居中 + 自动换行”。
-  - 列宽：除“图片/图片链接”外的文本列，会根据内容长度做近似自适应列宽（限定在 10~40 之间，避免过宽/过窄）。
-  - “价格”列表头识别为“价格”时会以纯数值写入（自动去掉货币符号与千分位），方便后续做数值计算与筛选。
-  - 自动合并：同一列中相邻且值相同的单元格会自动合并（包含“图片”列按原始 URL 判断是否相同）。合并后，仅在合并区域首行插入“链接的图片”，并按合并区域的总宽高等比缩放、居中显示。
-  - 主图区域图片提取（通常为规格图）：`sku_utils.get_main_image_url()` 已增强：
+  - 列宽：文本列根据内容长度近似自适应（限定在 10~40 之间）。
+  - “价格”列表头识别为“价格”时以纯数值写入（自动去掉货币符号与千分位），便于筛选与计算。
+  - 自动合并：同一列中相邻且值相同的单元格会自动合并。
+  - 主图区域图片提取（通常为规格图）：`sku_utils.get_main_image_url()` 仍保留用于日志调试与 YAML 规格图收集。
     - 顺序：`<img>.currentSrc/src/srcset/placeholder/data-src/data-ks-lazyload/...`、`<picture><source srcset>`；
     - 兜底：放大镜容器 `.js-image-zoom__zoomed-image` 的 `background-image`；`[class*='mainPicWrap']` 自身的 `background-image`；
     - 最终兜底：在全局尝试若干图片候选选择器，必要时使用 `meta[property='og:image']` / `link[rel=image_src]`；
@@ -92,15 +87,14 @@ $env:MAX_COMBOS=5; rcc run -r conf\robot.yaml
 
 ### 导出 YAML（区分商品主图与规格图）
 
-- 新结构不再使用 `imgs/imgs_local`，改为：
+- 结构说明：
   - `product_images` / `product_images_local`：商品主图画廊（预留，当前为空，后续可按需采集）
-  - `spec_images`：规格图列表（主图区域在选中带图规格后展示的图片），每项含 `file` 与 `url`
-  - `combos`：末位索引改为“规格图索引”（基于 `spec_images`）
+  - `spec_images`：规格图列表（主图区域在选中带图规格后展示的图片），每项含 `file` 与 `url`；规格图会下载到与 `result.yml` 同级目录，文件名为更友好的中文名。
+  - `combos`：每行仅包含“各维度选项索引..., 价格”（已移除规格图索引）
 
 ### 图片命名规则（下载到本地）
 
-- 规格图将以更可读的命名保存：`[维度名称]选项文本.png`，例如：`[颜色分类]胡桃木床 柔光夜灯带公牛插座.png`。
-- 若同名冲突，会自动追加 `(2)`, `(3)` 等后缀避免覆盖。
+- 规格图将以更可读的命名保存：`[维度名称]选项文本.png`，例如：`[颜色分类]胡桃木床 柔光夜灯带公牛插座.png`；同名冲突会自动追加 `(2)`, `(3)` 等后缀。
 
 ### 导出文件存放路径
 - 若通过 `robot.yaml`（RCC）运行：结果文件将保存为：`<artifactsDir>/[店铺名]商品名/result.xlsx`，其中 `<artifactsDir>` 由 `conf/robot.yaml` 的 `artifactsDir` 控制（默认 `../output`）。
@@ -112,7 +106,8 @@ $env:MAX_COMBOS=5; rcc run -r conf\robot.yaml
 
 ### 运行环境前提
 
-- “链接的图片”显示依赖 Windows + 本机安装 Microsoft Excel，并安装 `pywin32` 包；若 COM 不可用，将退化为仅显示超链接（不显示缩略图）。
+- 无需 Excel COM 进行图片处理，正常 Python 环境即可运行。
+- 下载规格图需要可访问外网；安装 `pillow` 可提升对多种图片格式的兼容与 PNG 统一化。
 
 ### 备注：关于“主图区域图片”
 

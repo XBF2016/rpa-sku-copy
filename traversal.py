@@ -158,8 +158,8 @@ def handle_single_combination(
 
         price = normalize_price_text(price)
 
-        # 结果行：各维度 + 图片(用于嵌入) + 图片链接(纯文本；主图区域展示的规格图) + 价格
-        result_row = [opt.text for opt in combination] + [image_url, image_url, price]
+        # 结果行：各维度 + 隐藏图片链接 + 价格（Excel 不展示该隐藏列）
+        result_row = [opt.text for opt in combination] + [image_url, price]
         print(f"[成功] 价格: {price}")
         elapsed_time = time.time() - start_time
         print(f"[耗时] 本组合用时 {elapsed_time:.3f} 秒")

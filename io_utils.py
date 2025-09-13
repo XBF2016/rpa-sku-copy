@@ -67,9 +67,41 @@ def _generate_spec_image_filenames(headers: List[str], results: List[List[str]],
       - 文件名 = f"[{维度名}]{选项}.png"；若无法识别，则回退为 f"图片_{md5前10}.png"；
       - 若同名冲突，则自动追加 " (2)", "(3)" 等后缀；
     """
-    # 维度列头
+    # 定位图片链接列索引
+    img_link_idx = -1
     try:
-        dim_names = [str(h) for h in headers[:-3]] if len(headers) >= 3 else []
+        img_link_idx = headers.index("图片链接")
+    except Exception:
+        # 兼容：当 headers 只有“各维度 + 价格”，数据行中可能额外包含一个隐藏的图片链接列
+        try:
+            if headers and headers[-1] == "价格":
+                # 常见形态：行长度 = len(headers) + 1，且该额外列为维度之后、价格之前
+                expected_img_idx = max(0, len(headers) - 1)
+                has_extra = any((len(r) == len(headers) + 1) for r in (results or []))
+                if has_extra:
+                    img_link_idx = expected_img_idx
+                else:
+                    # 兜底：扫描找出“看起来像URL”的稳定列
+                    candidate_counts = {}
+                    for row in results or []:
+                        for j, v in enumerate(row):
+                            try:
+                                s = str(v).strip().lower()
+                            except Exception:
+                                s = ''
+                            if s.startswith("http://") or s.startswith("https://"):
+                                candidate_counts[j] = candidate_counts.get(j, 0) + 1
+                    if candidate_counts:
+                        img_link_idx = max(candidate_counts.items(), key=lambda kv: kv[1])[0]
+        except Exception:
+            img_link_idx = -1
+
+    # 维度列头（若能定位图片链接列，则取其之前为维度；否则若以“价格”结尾，则维度=去掉最后一列）
+    try:
+        if img_link_idx != -1:
+            dim_names = [str(h) for h in headers[:img_link_idx]] if img_link_idx > 0 else []
+        else:
+            dim_names = [str(h) for h in headers[:-1]] if (headers and headers[-1] == "价格") else []
     except Exception:
         dim_names = []
     dim_count = len(dim_names)
@@ -80,8 +112,8 @@ def _generate_spec_image_filenames(headers: List[str], results: List[List[str]],
     for row in results or []:
         try:
             img_link = ''
-            if len(row) >= dim_count + 2:
-                img_link = str(row[dim_count + 1] or '').strip()
+            if img_link_idx != -1 and len(row) > img_link_idx:
+                img_link = str(row[img_link_idx] or '').strip()
             if not img_link or not (img_link.startswith('http://') or img_link.startswith('https://')):
                 continue
             if img_link not in url_to_rows:
@@ -315,6 +347,14 @@ def _merge_consecutive_cells(ws, results: List[List[str]], headers: List[str], i
         n_rows = len(results)
         n_cols = len(headers)
 
+        # 价格列不进行合并（通常为最后一列）
+        price_col_idx = -1
+        try:
+            if headers and headers[-1] == "价格":
+                price_col_idx = len(headers) - 1
+        except Exception:
+            price_col_idx = -1
+
         def get_key(row_idx0: int, col_idx0: int):
             try:
                 val = results[row_idx0][col_idx0]
@@ -334,6 +374,8 @@ def _merge_consecutive_cells(ws, results: List[List[str]], headers: List[str], i
                 return ""
 
         for col in range(n_cols):
+            if col == price_col_idx:
+                continue
             start = 0  # results 的 0 基索引（对应 Excel 的第 2 行）
             prev_key = get_key(0, col) if n_rows > 0 else None
             for i in range(1, n_rows + 1):  # 走到 n_rows 作为哨兵触发收尾
@@ -360,12 +402,10 @@ def _merge_consecutive_cells(ws, results: List[List[str]], headers: List[str], i
 def export_results_to_excel(results: List[List[str]], headers: List[str], file_path: Path) -> Path:
     """使用 openpyxl 将结果写入 Excel（含表头），返回最终保存的文件路径（可能是带时间戳的备选文件）。
     行为说明：
-    - 若表头包含“图片”列：对图片链接去重后，仅下载一次并统一转为 PNG 保存到与 result.xlsx 同级目录；导出后通过 Excel COM 在“图片”列以“链接的图片”方式显示缩略图（不嵌入，体积小，默认预览宽高约 60px）。
-      - 无 Pillow/requests 或下载失败/COM 不可用时，退化为在“图片”列写入原始 URL 的超链接（文本为“查看图片”）。
-    - “图片链接”列保留原始网络 URL。
+    - Excel 仅导出“各维度 + 价格”。若结果行中包含隐藏的图片链接列，将自动忽略，不写入工作簿。
     - 全表统一样式：水平/垂直居中，自动换行；文本列近似自适应列宽。
     - 若最后一列表头为“价格”，将该列写为纯数值（去掉人民币符号与千分位）。
-    - 自动合并：同一列中相邻且值相同的单元格会自动合并（含“图片”列按原始 URL 判断）。合并后，仅在合并区域首行插入“链接的图片”，并按合并区域尺寸进行等比缩放与居中。
+    - 自动合并：同一列中相邻且值相同的单元格会自动合并。
     """
     wb = Workbook()
     ws = wb.active
@@ -380,96 +420,39 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
     # 统计每列最大文本长度（用于后续列宽自适应）
     max_text_len = [len(str(h)) for h in headers]
 
-    # 识别“图片”与“图片链接”列索引（没有则返回 -1）
+    # 识别“图片”与“图片链接”列索引（没有则返回 -1）——当前逻辑已不包含图片列
     img_col_idx = -1
     img_link_col_idx = -1
-    try:
-        img_col_idx = headers.index("图片")
-    except ValueError:
-        img_col_idx = -1
-    try:
-        img_link_col_idx = headers.index("图片链接")
-    except ValueError:
-        img_link_col_idx = -1
 
     # 去重图片链接并下载到与 Excel 同级目录（统一转为 PNG，使用友好文件名如：[维度]选项.png）
     img_output_dir = file_path.parent
     url_to_filename = {}
-    if img_col_idx != -1:
-        # 基于结果推断友好文件名映射
-        spec_img_urls, friendly_map = _generate_spec_image_filenames(headers, results, img_output_dir)
-        url_to_filename = {u: friendly_map.get(u) for u in spec_img_urls}
-
-        downloaded = 0
-        for u in spec_img_urls:
-            fname = friendly_map.get(u)
-            if not fname:
-                continue
-            target = img_output_dir / fname
-            # 若 requests 或 Pillow 不可用，则跳过实际下载（后续 Excel 将退回为URL插入）
-            if (requests is None) or (not _HAS_PILLOW):
-                continue
-            if target.exists():
-                continue
-            try:
-                # 加强下载头，提升电商站点直链下载成功率
-                req_headers = {
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
-                    ),
-                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                    "Accept-Language": "zh-CN,zh;q=0.9",
-                    "Referer": f"{urlparse(u).scheme}://{urlparse(u).hostname}/",
-                    "Connection": "keep-alive",
-                }
-                resp = requests.get(u, headers=req_headers, timeout=20)
-                resp.raise_for_status()
-                from io import BytesIO
-                bio = BytesIO(resp.content)
-                pil_img = PILImage.open(bio)
-                # 规整模式，避免某些色彩模式导致保存失败
-                if pil_img.mode not in ("RGB", "RGBA"):
-                    pil_img = pil_img.convert("RGB")
-                # 统一转为 PNG 保存到磁盘
-                pil_img.save(target, format="PNG")
-                downloaded += 1
-            except Exception:
-                # 下载失败不影响导出
-                pass
-        try:
-            if spec_img_urls:
-                print(f"[步骤] 检测到 {len(spec_img_urls)} 个唯一图片链接，已下载 {downloaded} 张到: {img_output_dir}")
-        except Exception:
-            pass
+    # 已移除图片处理逻辑
 
     # 统一设置图片与链接列列宽（若存在）
-    if img_col_idx != -1:
-        col_letter = get_column_letter(img_col_idx + 1)
-        # 设定预览列宽（像素 -> 列宽），缩小为原 1/4（60px）
-        _IMG_PREVIEW_PX = 60
-        ws.column_dimensions[col_letter].width = _px_to_col_width(_IMG_PREVIEW_PX)
-    if img_link_col_idx != -1:
-        col_letter_link = get_column_letter(img_link_col_idx + 1)
-        # “图片链接”列更宽，便于查看与复制
-        ws.column_dimensions[col_letter_link].width = 90
+    # 不含图片列，无需设置图片列宽
 
     for row in results:
         # 价格列数值化（要求“价格”为最后一列表头）
-        if headers and headers[-1] == "价格" and any(ch.isdigit() for ch in str(row[-1])):
-            row[-1] = float(next((t for t in ''.join((c if (c.isdigit() or c in '.,') else ' ') for c in str(row[-1])).split() if t), '0').replace(',', ''))
-
-        # 先写一整行文本；若存在“图片”列，先留空，后续在单元格中嵌入缩略图
-        row_for_write = list(row)
-        local_name = None
-        img_url_cur = None
-        if img_col_idx != -1 and img_col_idx < len(row_for_write):
+        if headers and headers[-1] == "价格":
+            # 价格在行的最后一个元素（隐藏图片列在价格前一位，故不能用表头索引）
             try:
-                img_url_cur = str(row[img_col_idx]).strip()
+                last_val = row[-1]
             except Exception:
-                img_url_cur = ""
-            local_name = url_to_filename.get(img_url_cur) if 'url_to_filename' in locals() else None  # type: ignore
-            row_for_write[img_col_idx] = ""
+                last_val = ""
+            if any(ch.isdigit() for ch in str(last_val)):
+                row[-1] = float(next((t for t in ''.join((c if (c.isdigit() or c in '.,') else ' ') for c in str(last_val)).split() if t), '0').replace(',', ''))
+
+        # 写入“各维度 + 价格”：取前 len(headers)-1 个为维度，最后一项强制取行末尾（价格）
+        try:
+            dims_part = list(row[:max(0, len(headers) - 1)])
+        except Exception:
+            dims_part = []
+        try:
+            price_part = [row[-1]] if headers and len(headers) >= 1 else []
+        except Exception:
+            price_part = [""]
+        row_for_write = dims_part + price_part
         ws.append(row_for_write)
         current_row = ws.max_row
 
@@ -480,8 +463,6 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
         # 统计文本长度用于自适应列宽（以写入后的内容计算，图片列跳过）
         for j in range(len(headers)):
             try:
-                if j == img_col_idx:
-                    continue
                 txt = row_for_write[j] if j < len(row_for_write) else ""
                 txt_len = len(str(txt))
             except Exception:
@@ -489,40 +470,21 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
             if j < len(max_text_len) and txt_len > max_text_len[j]:
                 max_text_len[j] = txt_len
 
-        # 在“图片”列写入一个备用超链接（文本：查看图片），即使后续通过 COM 插入了缩略图，超链接也不会产生负面影响
-        if img_col_idx != -1 and img_col_idx < len(headers):
-            try:
-                if img_url_cur and isinstance(img_url_cur, str) and img_url_cur.strip().lower().startswith(("http://", "https://")):
-                    cell = ws.cell(row=current_row, column=img_col_idx + 1)
-                    cell.value = "查看图片"
-                    cell.hyperlink = img_url_cur
-            except Exception:
-                pass
+        # 不含图片列，无需写入备用超链接
 
     # 文本列近似自适应列宽（跳过“图片”与“图片链接”列）
     for j in range(len(headers)):
-        if j == img_col_idx or j == img_link_col_idx:
-            continue
         col_letter_j = get_column_letter(j + 1)
         # 控制在 [10, 40] 以内，避免过窄或过宽
         target_width = max(10, min(40, (max_text_len[j] if j < len(max_text_len) else 10) + 2))
         ws.column_dimensions[col_letter_j].width = target_width
 
     # 若存在图片列，给数据行一个适中的行高，便于后续 COM 插入的图片按单元格自适应可见
-    if img_col_idx != -1:
-        try:
-            # 行高与预览保持一致（像素 -> point），缩小为 60px
-            _IMG_PREVIEW_PX_H = 60
-            target_row_h_pts = _px_to_points(_IMG_PREVIEW_PX_H)
-            for r in range(2, ws.max_row + 1):
-                cur_h = ws.row_dimensions[r].height or 0
-                ws.row_dimensions[r].height = max(cur_h, target_row_h_pts)
-        except Exception:
-            pass
+    # 不含图片列，无需设置行高
 
     # 保存前：按列合并相邻相同值（包含“图片”列基于URL判断）
     try:
-        _merge_consecutive_cells(ws, results, headers, img_col_idx)
+        _merge_consecutive_cells(ws, results, headers, -1)
     except Exception:
         pass
 
@@ -541,12 +503,7 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
             print(f"[错误] 导出Excel失败: {e2}")
             raise
     
-    # 使用 Excel COM 将图片以“链接方式”插入到单元格中（不占用 Excel 体积）
-    try:
-        _insert_linked_images_via_excel(final_path, img_col_idx, url_to_filename, results)
-    except Exception:
-        # 插入失败不影响导出
-        pass
+    # 不再插入图片
     return final_path
 
 
@@ -559,15 +516,17 @@ def export_results_to_yaml(sku_dimensions, results: List[List[str]], headers: Li
     - spec_images: 规格图列表（主图区域在选中带图规格后展示的图片），每项为：
         - file: 本地文件名（如：[颜色分类]米白色.png）
         - url: 图片URL
-    - combos: 紧凑列表，每行 = [每个维度的选项索引..., 价格, 规格图索引]
+    - combos: 紧凑列表，每行 = [每个维度的选项索引..., 价格]
       说明：
         - 选项索引为基于 specs[维度] 中的序号（从 0 开始）
         - 价格为数值（若无法解析则为 null）
-        - 规格图索引为基于 spec_images 的序号（从 0 开始；无图则为 null）
     """
     # 计算维度名称列表（与 headers 对齐）
     try:
-        dim_names = [str(h) for h in headers[:-3]] if len(headers) >= 3 else [getattr(d, 'name', f'维度{i+1}') for i, d in enumerate(sku_dimensions)]
+        if headers and headers[-1] == "价格":
+            dim_names = [str(h) for h in headers[:-1]]
+        else:
+            dim_names = [getattr(d, 'name', f'维度{i+1}') for i, d in enumerate(sku_dimensions)]
     except Exception:
         dim_names = [getattr(d, 'name', f'维度{i+1}') for i, d in enumerate(sku_dimensions)]
     dim_count = len(dim_names)
@@ -649,7 +608,50 @@ def export_results_to_yaml(sku_dimensions, results: List[List[str]], headers: Li
     # 去重“规格图”并生成友好文件名（与 Excel 下载/命名规则一致）
     out_dir = file_path.parent
     spec_img_urls, friendly_map = _generate_spec_image_filenames(headers, results, out_dir)
-    spec_img_to_idx = {u: i for i, u in enumerate(spec_img_urls)}
+
+    # 下载规格图到本地（与友好文件名一致保存为 PNG；在缺少 Pillow 时以原始字节落盘）
+    downloaded = 0
+    if spec_img_urls:
+        for u in spec_img_urls:
+            try:
+                fname = friendly_map.get(u) or f"图片_{hashlib.md5(u.encode('utf-8')).hexdigest()[:10]}.png"
+                target = out_dir / fname
+                if target.exists():
+                    continue
+                # 若 requests 不可用，跳过下载
+                if requests is None:
+                    continue
+                req_headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
+                    ),
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Referer": f"{urlparse(u).scheme}://{urlparse(u).hostname}/",
+                    "Connection": "keep-alive",
+                }
+                resp = requests.get(u, headers=req_headers, timeout=20)
+                resp.raise_for_status()
+                if _HAS_PILLOW:
+                    from io import BytesIO
+                    bio = BytesIO(resp.content)
+                    pil_img = PILImage.open(bio)
+                    if pil_img.mode not in ("RGB", "RGBA"):
+                        pil_img = pil_img.convert("RGB")
+                    pil_img.save(target, format="PNG")
+                else:
+                    # 无 Pillow：直接按 PNG 后缀落盘原始字节（可能非 PNG，但保证文件存在）
+                    with open(target, 'wb') as fbin:
+                        fbin.write(resp.content)
+                downloaded += 1
+            except Exception:
+                pass
+        try:
+            if downloaded:
+                print(f"[步骤] 已下载规格图 {downloaded} 张到: {out_dir}")
+        except Exception:
+            pass
 
     # 生成 YAML 文本（紧凑形式 + 注释）
     lines: List[str] = []
@@ -678,9 +680,9 @@ def export_results_to_yaml(sku_dimensions, results: List[List[str]], headers: Li
         lines.append('  - file: ' + _yaml_escape_value(file_name) + '\n')
         lines.append('    url: ' + _yaml_escape_value(u) + '\n')
 
-    lines.append('\n# 紧凑组合：每行 = [各维度选项索引..., 价格, 规格图索引]\n')
-    lines.append('# 说明：选项索引基于 specs[dims[i]]（0 起）；价格为数值或 null；规格图索引基于 spec_images（0 起）或 null\n')
-    # 紧凑组合：行内序列（flow style）：[d0, d1, ..., price, imgIdx]
+    lines.append('\n# 紧凑组合：每行 = [各维度选项索引..., 价格]\n')
+    lines.append('# 说明：选项索引基于 specs[dims[i]]（0 起）；价格为数值或 null\n')
+    # 紧凑组合：行内序列（flow style）：[d0, d1, ..., price]
     lines.append('combos:\n')
     for row in results or []:
         try:
@@ -698,17 +700,8 @@ def export_results_to_yaml(sku_dimensions, results: List[List[str]], headers: Li
             price_val = row[-1] if row else ''
             price_num, _price_text = _extract_price(price_val)
             price_repr = 'null' if price_num is None else (str(price_num))
-            # 图片索引
-            img_link = ''
-            if len(row) >= dim_count + 2:
-                try:
-                    img_link = str(row[dim_count + 1] or '').strip()
-                except Exception:
-                    img_link = ''
-            img_idx = spec_img_to_idx.get(img_link, None) if img_link else None
-            img_repr = 'null' if (img_idx is None) else str(int(img_idx))
-            # 合成一行：-[idxs..., price, imgIdx]
-            arr = ', '.join(idx_list + [price_repr, img_repr])
+            # 合成一行：-[idxs..., price]
+            arr = ', '.join(idx_list + [price_repr])
             lines.append(f"  - [{arr}]\n")
         except Exception:
             continue

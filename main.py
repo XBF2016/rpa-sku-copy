@@ -82,8 +82,8 @@ def traverse_all_sku_combinations():
 
         print(f"\n[步骤] 遍历完成！成功处理 {success_count}/{len(combinations)} 个组合")
 
-        # 导出结果到 Excel（包含表头）：各维度 + 图片 + 图片链接 + 价格
-        headers = [dim.name for dim in sku_dimensions] + ["图片", "图片链接", "价格"]
+        # 导出结果到 Excel（包含表头）：各维度 + 价格（不包含图片相关列）
+        headers = [dim.name for dim in sku_dimensions] + ["价格"]
 
         # 根据“店铺名+商品名”建立子目录
         def _safe_name(n: str) -> str:
