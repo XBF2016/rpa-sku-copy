@@ -37,6 +37,116 @@ def _px_to_points(px: float) -> float:
     return float(px) * 72.0 / 96.0
 
 
+def _sanitize_filename_component(name: str) -> str:
+    """清理文件名非法字符并压缩空白。"""
+    try:
+        s = str(name or "").strip()
+    except Exception:
+        s = ""
+    # Windows 非法字符: \ / : * ? " < > |
+    for ch in ['\\', '/', ':', '*', '?', '"', '<', '>', '|']:
+        s = s.replace(ch, ' ')
+    # 压缩空白
+    s = ' '.join(s.split())
+    # 避免结尾空格或点
+    s = s.rstrip(' .')
+    # 简单截断，保留足够长度（考虑后缀）
+    if len(s) > 120:
+        s = s[:120]
+    return s or "未命名"
+
+
+def _generate_spec_image_filenames(headers: List[str], results: List[List[str]], out_dir: Path):
+    """基于结果表推断每个规格图的友好文件名。
+    返回 (spec_img_urls, url_to_filename)，其中：
+      - spec_img_urls: 按首次出现顺序的唯一图片URL列表
+      - url_to_filename: URL -> 友好文件名（如：[颜色分类]胡桃木床 柔光夜灯带公牛插座.png）
+    规则：
+      - 找到引用该 URL 的所有行，识别值恒定的维度列；
+      - 若存在多个恒定维度，优先名字含“颜色/色/color”的维度；否则取第一个恒定维度；
+      - 文件名 = f"[{维度名}]{选项}.png"；若无法识别，则回退为 f"图片_{md5前10}.png"；
+      - 若同名冲突，则自动追加 " (2)", "(3)" 等后缀；
+    """
+    # 维度列头
+    try:
+        dim_names = [str(h) for h in headers[:-3]] if len(headers) >= 3 else []
+    except Exception:
+        dim_names = []
+    dim_count = len(dim_names)
+
+    # URL 去重（首次出现顺序）及被哪些行引用
+    spec_img_urls: List[str] = []
+    url_to_rows: dict[str, List[List[str]]] = {}
+    for row in results or []:
+        try:
+            img_link = ''
+            if len(row) >= dim_count + 2:
+                img_link = str(row[dim_count + 1] or '').strip()
+            if not img_link or not (img_link.startswith('http://') or img_link.startswith('https://')):
+                continue
+            if img_link not in url_to_rows:
+                url_to_rows[img_link] = []
+                spec_img_urls.append(img_link)
+            url_to_rows[img_link].append(row)
+        except Exception:
+            continue
+
+    def _prefer_dim_index(name: str) -> int:
+        try:
+            nm = (name or '').lower()
+        except Exception:
+            nm = ''
+        if any(k in nm for k in ['颜色', '顏色', '色', 'color']):
+            return 0
+        return 1
+
+    # 生成唯一文件名
+    used_names: set[str] = set()
+    url_to_filename: dict[str, str] = {}
+    for url in spec_img_urls:
+        rows_for_img = url_to_rows.get(url, [])
+        chosen_dim_idx = None
+        if rows_for_img:
+            constant_dims: List[int] = []
+            for di in range(dim_count):
+                try:
+                    values = {str(r[di]).strip() for r in rows_for_img}
+                except Exception:
+                    values = set()
+                if len(values) == 1:
+                    constant_dims.append(di)
+            if constant_dims:
+                chosen_dim_idx = sorted(constant_dims, key=lambda i: (_prefer_dim_index(dim_names[i]), i))[0]
+
+        if chosen_dim_idx is not None:
+            try:
+                dim_name = _sanitize_filename_component(dim_names[chosen_dim_idx])
+            except Exception:
+                dim_name = '规格'
+            try:
+                opt_text = _sanitize_filename_component(rows_for_img[0][chosen_dim_idx])
+            except Exception:
+                opt_text = '未命名'
+            base = f"[{dim_name}]{opt_text}"
+        else:
+            # 回退：使用短哈希
+            base = f"图片_{hashlib.md5(url.encode('utf-8')).hexdigest()[:10]}"
+
+        candidate = base
+        suffix = 2
+        # 仅在本次生成范围内去重（避免与历史同名文件冲突导致 YAML 出现 "(2)"）
+        while True:
+            filename = candidate + ".png"
+            if filename not in used_names:
+                used_names.add(filename)
+                break
+            candidate = f"{base} ({suffix})"
+            suffix += 1
+        url_to_filename[url] = filename
+
+    return spec_img_urls, url_to_filename
+
+
 def _insert_linked_images_via_excel(xlsx_path: Path, img_col_idx: int, url_to_filename: dict, results: List[List[str]]) -> None:
     """使用 Excel COM（win32com）在目标列插入“链接的图片”，不将图片数据保存进 Excel。
     - LinkToFile=True, SaveWithDocument=False
@@ -282,31 +392,23 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
     except ValueError:
         img_link_col_idx = -1
 
-    # 去重图片链接并下载到与 Excel 同级目录（统一转为 PNG）
+    # 去重图片链接并下载到与 Excel 同级目录（统一转为 PNG，使用友好文件名如：[维度]选项.png）
     img_output_dir = file_path.parent
     url_to_filename = {}
     if img_col_idx != -1:
-        unique_urls = []
-        seen = set()
-        for row in results:
-            try:
-                u = str(row[img_col_idx]).strip()
-            except Exception:
-                u = ""
-            if u and u.startswith("http") and u not in seen:
-                seen.add(u)
-                unique_urls.append(u)
+        # 基于结果推断友好文件名映射
+        spec_img_urls, friendly_map = _generate_spec_image_filenames(headers, results, img_output_dir)
+        url_to_filename = {u: friendly_map.get(u) for u in spec_img_urls}
 
         downloaded = 0
-        for u in unique_urls:
-            short = hashlib.md5(u.encode("utf-8")).hexdigest()[:10]
-            fname = f"img_{short}.png"  # 统一转为 PNG
-            target = img_output_dir / fname
-            # 若 requests 或 Pillow 不可用，则直接标记为 None：后续回退为 URL
-            if (requests is None) or (not _HAS_PILLOW):
-                url_to_filename[u] = None
+        for u in spec_img_urls:
+            fname = friendly_map.get(u)
+            if not fname:
                 continue
-            url_to_filename[u] = fname  # 先建立映射（即便下载/转换失败也可回退）
+            target = img_output_dir / fname
+            # 若 requests 或 Pillow 不可用，则跳过实际下载（后续 Excel 将退回为URL插入）
+            if (requests is None) or (not _HAS_PILLOW):
+                continue
             if target.exists():
                 continue
             try:
@@ -333,10 +435,11 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
                 pil_img.save(target, format="PNG")
                 downloaded += 1
             except Exception:
-                url_to_filename[u] = None  # 下载失败：后续回退为URL
+                # 下载失败不影响导出
+                pass
         try:
-            if unique_urls:
-                print(f"[步骤] 检测到 {len(unique_urls)} 个唯一图片链接，已下载 {downloaded} 张到: {img_output_dir}")
+            if spec_img_urls:
+                print(f"[步骤] 检测到 {len(spec_img_urls)} 个唯一图片链接，已下载 {downloaded} 张到: {img_output_dir}")
         except Exception:
             pass
 
@@ -448,22 +551,26 @@ def export_results_to_excel(results: List[List[str]], headers: List[str], file_p
 
 
 def export_results_to_yaml(sku_dimensions, results: List[List[str]], headers: List[str], file_path: Path) -> Path:
-    """将规格维度与组合信息导出为更紧凑的 YAML：
+    """将规格维度与组合信息导出为更清晰的 YAML：
     - specs: 维度 -> 选项列表（与示例一致，便于人工查看）
     - dims:  维度名称顺序（用于索引解释）
-    - imgs:  去重后的图片URL列表
-    - imgs_local: 与 imgs 同索引的本地图片文件名（位于 output 子目录）
-    - combos: 紧凑列表，每行 = [每个维度的选项索引..., 价格, 图片索引]
+    - product_images: 商品主图画廊（当前未专门采集，暂为空数组，后续可扩展）
+    - product_images_local: 与 product_images 对齐的本地文件名（当前为空数组）
+    - spec_images: 规格图列表（主图区域在选中带图规格后展示的图片），每项为：
+        - file: 本地文件名（如：[颜色分类]米白色.png）
+        - url: 图片URL
+    - combos: 紧凑列表，每行 = [每个维度的选项索引..., 价格, 规格图索引]
       说明：
         - 选项索引为基于 specs[维度] 中的序号（从 0 开始）
         - 价格为数值（若无法解析则为 null）
-        - 图片索引为基于 imgs 的序号（从 0 开始；无图则为 null）
+        - 规格图索引为基于 spec_images 的序号（从 0 开始；无图则为 null）
     """
     # 计算维度名称列表（与 headers 对齐）
     try:
         dim_names = [str(h) for h in headers[:-3]] if len(headers) >= 3 else [getattr(d, 'name', f'维度{i+1}') for i, d in enumerate(sku_dimensions)]
     except Exception:
         dim_names = [getattr(d, 'name', f'维度{i+1}') for i, d in enumerate(sku_dimensions)]
+    dim_count = len(dim_names)
 
     # 构建 specs 映射：维度 -> 选项列表，并保留维度顺序
     specs_map = {}
@@ -539,35 +646,10 @@ def export_results_to_yaml(sku_dimensions, results: List[List[str]], headers: Li
             pass
         return None, s
 
-    # 去重图片，建立 imgs 列表与 url->idx 映射
-    imgs: List[str] = []
-    img_to_idx = {}
-    dim_count = len(dim_names)
-    for row in results or []:
-        try:
-            img_link = ''
-            if len(row) >= dim_count + 2:
-                img_link = str(row[dim_count + 1] or '').strip()
-            if img_link and (img_link.startswith('http://') or img_link.startswith('https://')):
-                if img_link not in img_to_idx:
-                    img_to_idx[img_link] = len(imgs)
-                    imgs.append(img_link)
-        except Exception:
-            continue
-
-    # 生成 imgs_local（与 imgs 对齐）。文件名规则与 Excel 导出一致：img_<md5(url)的前10位>.png
-    imgs_local: List[str | None] = []  # None 表示本地文件不存在
+    # 去重“规格图”并生成友好文件名（与 Excel 下载/命名规则一致）
     out_dir = file_path.parent
-    for u in imgs:
-        try:
-            short = hashlib.md5(u.encode('utf-8')).hexdigest()[:10]
-            fname = f"img_{short}.png"
-            if (out_dir / fname).exists():
-                imgs_local.append(fname)
-            else:
-                imgs_local.append(None)
-        except Exception:
-            imgs_local.append(None)
+    spec_img_urls, friendly_map = _generate_spec_image_filenames(headers, results, out_dir)
+    spec_img_to_idx = {u: i for i, u in enumerate(spec_img_urls)}
 
     # 生成 YAML 文本（紧凑形式 + 注释）
     lines: List[str] = []
@@ -585,22 +667,19 @@ def export_results_to_yaml(sku_dimensions, results: List[List[str]], headers: Li
     for dim in dim_names:
         lines.append(f"  - {_yaml_escape_key(dim)}\n")
 
-    lines.append('\n# 去重后的图片URL；与 imgs_local 一一对应\n')
-    # 图片去重表
-    lines.append('imgs:\n')
-    for u in imgs:
-        lines.append(f"  - {_yaml_escape_value(u)}\n")
+    lines.append('\n# 商品主图（主图画廊，当前未专门采集，预留字段）\n')
+    lines.append('product_images: []\n')
+    lines.append('product_images_local: []\n')
 
-    lines.append('\n# 本地图片文件名（位于输出子目录）；与 imgs 同索引对齐\n')
-    lines.append('imgs_local:\n')
-    for fn in imgs_local:
-        if fn is None:
-            lines.append('  - null\n')
-        else:
-            lines.append(f"  - {_yaml_escape_value(fn)}\n")
+    lines.append('\n# 规格图（主图区域在选中特定规格后展示的图片）\n')
+    lines.append('spec_images:\n')
+    for u in spec_img_urls:
+        file_name = friendly_map.get(u) or f"图片_{hashlib.md5(u.encode('utf-8')).hexdigest()[:10]}.png"
+        lines.append('  - file: ' + _yaml_escape_value(file_name) + '\n')
+        lines.append('    url: ' + _yaml_escape_value(u) + '\n')
 
-    lines.append('\n# 紧凑组合：每行 = [各维度选项索引..., 价格, 图片索引]\n')
-    lines.append('# 说明：选项索引基于 specs[dims[i]]（0 起）；价格为数值或 null；图片索引基于 imgs（0 起）或 null\n')
+    lines.append('\n# 紧凑组合：每行 = [各维度选项索引..., 价格, 规格图索引]\n')
+    lines.append('# 说明：选项索引基于 specs[dims[i]]（0 起）；价格为数值或 null；规格图索引基于 spec_images（0 起）或 null\n')
     # 紧凑组合：行内序列（flow style）：[d0, d1, ..., price, imgIdx]
     lines.append('combos:\n')
     for row in results or []:
@@ -626,7 +705,7 @@ def export_results_to_yaml(sku_dimensions, results: List[List[str]], headers: Li
                     img_link = str(row[dim_count + 1] or '').strip()
                 except Exception:
                     img_link = ''
-            img_idx = img_to_idx.get(img_link, None) if img_link else None
+            img_idx = spec_img_to_idx.get(img_link, None) if img_link else None
             img_repr = 'null' if (img_idx is None) else str(int(img_idx))
             # 合成一行：-[idxs..., price, imgIdx]
             arr = ', '.join(idx_list + [price_repr, img_repr])

@@ -23,7 +23,7 @@ PRICE_ALT_SELECTORS = [
     "[class*='highlightPrice'] [class*='text']",
 ]
 
-# 主图相关选择器（方案A）
+# 主图区域相关选择器（展示图片可能为规格图）
 MAIN_PIC_IMG_SELECTOR = "img[class*='mainPic']"
 ZOOM_IMG_DIV_SELECTOR = ".js-image-zoom__zoomed-image"
 
@@ -217,11 +217,12 @@ def get_price_text(driver) -> str:
 
 
 def get_main_image_url(driver) -> str:
-    """获取当前主图的大图 URL（增强版）。
+    """获取当前“主图区域”展示图片的大图 URL（增强版）。
+    说明：主图区域会在点击带图片的规格（如“颜色分类”）后展示该规格图，因此该链接通常为“规格图”，不一定是商品全局主图。
     优先顺序：
-    1) 主图 <img> 的 currentSrc（适配 srcset）
-    2) 主图 <img> 的 src（直接地址，可能为 .webp 等）
-    3) 主图 <img> 的 srcset/placeholder/data-src/data-ks-lazyload、<picture> 下 <source> 的 srcset
+    1) 主图区域 <img> 的 currentSrc（适配 srcset）
+    2) 主图区域 <img> 的 src（直接地址，可能为 .webp 等）
+    3) 主图区域 <img> 的 srcset/placeholder/data-src/data-ks-lazyload、<picture> 下 <source> 的 srcset
     4) 兜底：放大镜容器（.js-image-zoom__zoomed-image）的 background-image URL
     仅返回以 http/https 开头的链接，避免 data: 等占位符。
     """
@@ -335,7 +336,7 @@ def get_main_image_url(driver) -> str:
         "  return '';\n"
         "})(arguments[0], arguments[1]);"
     )
-    # Python 端短轮询：等待主图URL在点击SKU后稳定可用（最多 ~0.8s）
+    # Python 端短轮询：等待主图区域图片URL在点击SKU后稳定可用（最多 ~0.8s）
     end_time = time.perf_counter() + 0.8
     last = ""
     while time.perf_counter() < end_time:
@@ -355,7 +356,7 @@ def get_main_image_url(driver) -> str:
     # 若超时仍无 http 链接，输出详细调试信息
     try:
         if last:
-            log_debug(f"主图URL候选(非http): {last}")
+            log_debug(f"主图区域图片URL候选(非http): {last}")
         dbg = driver.execute_script(
             "return (function(imgSel, zoomSel){\n"
             "  try{\n"
@@ -385,7 +386,7 @@ def get_main_image_url(driver) -> str:
             ZOOM_IMG_DIV_SELECTOR,
         ) or ''
         if dbg:
-            log_debug(f"主图调试: {dbg}")
+            log_debug(f"主图区域图片调试: {dbg}")
     except Exception:
         pass
     return last if (last.startswith("http://") or last.startswith("https://")) else ""

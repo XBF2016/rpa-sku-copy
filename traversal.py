@@ -141,7 +141,7 @@ def handle_single_combination(
         price = get_price_text(driver)
         image_url = get_main_image_url(driver)
         t_price_end = time.perf_counter()
-        # 调试输出主图URL，便于快速定位问题
+        # 调试输出主图区域图片URL（通常为规格图），便于快速定位问题
         try:
             print(f"[图片] 链接: {image_url if image_url else '空'}")
             try:
@@ -158,7 +158,7 @@ def handle_single_combination(
 
         price = normalize_price_text(price)
 
-        # 结果行：各维度 + 图片(用于嵌入) + 图片链接(纯文本) + 价格
+        # 结果行：各维度 + 图片(用于嵌入) + 图片链接(纯文本；主图区域展示的规格图) + 价格
         result_row = [opt.text for opt in combination] + [image_url, image_url, price]
         print(f"[成功] 价格: {price}")
         elapsed_time = time.time() - start_time

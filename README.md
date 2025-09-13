@@ -83,12 +83,24 @@ $env:MAX_COMBOS=5; rcc run -r conf\robot.yaml
   - 列宽：除“图片/图片链接”外的文本列，会根据内容长度做近似自适应列宽（限定在 10~40 之间，避免过宽/过窄）。
   - “价格”列表头识别为“价格”时会以纯数值写入（自动去掉货币符号与千分位），方便后续做数值计算与筛选。
   - 自动合并：同一列中相邻且值相同的单元格会自动合并（包含“图片”列按原始 URL 判断是否相同）。合并后，仅在合并区域首行插入“链接的图片”，并按合并区域的总宽高等比缩放、居中显示。
-  - 主图提取：`sku_utils.get_main_image_url()` 已增强：
+  - 主图区域图片提取（通常为规格图）：`sku_utils.get_main_image_url()` 已增强：
     - 顺序：`<img>.currentSrc/src/srcset/placeholder/data-src/data-ks-lazyload/...`、`<picture><source srcset>`；
     - 兜底：放大镜容器 `.js-image-zoom__zoomed-image` 的 `background-image`；`[class*='mainPicWrap']` 自身的 `background-image`；
-    - 最终兜底：在全局尝试若干主图候选选择器，必要时使用 `meta[property='og:image']` / `link[rel=image_src]`；
+    - 最终兜底：在全局尝试若干图片候选选择器，必要时使用 `meta[property='og:image']` / `link[rel=image_src]`；
     - 兼容以 `//` 开头的协议相对地址（自动补全为 `https:`）；
     - 在点击SKU后做短轮询等待（~0.8s）并尝试触发一次主图区域的悬停，以促使放大镜背景图预加载。
+
+### 导出 YAML（区分商品主图与规格图）
+
+- 新结构不再使用 `imgs/imgs_local`，改为：
+  - `product_images` / `product_images_local`：商品主图画廊（预留，当前为空，后续可按需采集）
+  - `spec_images`：规格图列表（主图区域在选中带图规格后展示的图片），每项含 `file` 与 `url`
+  - `combos`：末位索引改为“规格图索引”（基于 `spec_images`）
+
+### 图片命名规则（下载到本地）
+
+- 规格图将以更可读的命名保存：`[维度名称]选项文本.png`，例如：`[颜色分类]胡桃木床 柔光夜灯带公牛插座.png`。
+- 若同名冲突，会自动追加 `(2)`, `(3)` 等后缀避免覆盖。
 
 ### 导出文件存放路径
 - 若通过 `robot.yaml`（RCC）运行：结果文件将保存为：`<artifactsDir>/[店铺名]商品名/result.xlsx`，其中 `<artifactsDir>` 由 `conf/robot.yaml` 的 `artifactsDir` 控制（默认 `../output`）。
@@ -101,3 +113,7 @@ $env:MAX_COMBOS=5; rcc run -r conf\robot.yaml
 ### 运行环境前提
 
 - “链接的图片”显示依赖 Windows + 本机安装 Microsoft Excel，并安装 `pywin32` 包；若 COM 不可用，将退化为仅显示超链接（不显示缩略图）。
+
+### 备注：关于“主图区域图片”
+
+- 淘宝详情页主图区域在选择带图片的规格（如“颜色分类”）后，会显示该规格图。因此本项目抓取到的“图片链接”是“主图区域当前展示的规格图”，并非全局商品主图。
