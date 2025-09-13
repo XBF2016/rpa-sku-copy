@@ -108,6 +108,25 @@ def build_edge_driver() -> webdriver.Edge:
 
     def _try_attach_mode_on_failure(e: Exception):
         msg = str(e)
+        # 情况一：用户数据目录被占用
+        if ("already in use" in msg) or ("user data directory" in msg and "in use" in msg) or ("--user-data-dir" in msg and "in use" in msg):
+            try:
+                TEMP_DIR.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            # 使用时间戳创建唯一的临时用户数据目录，避免并发冲突
+            tmp_ud = str(TEMP_DIR / f"edge-user-data-{int(time.time())}")
+            print(f"[警告] 检测到用户数据目录被占用，将回退为临时用户数据目录启动：{tmp_ud}")
+            try:
+                opts_tmp = _make_edge_options(tmp_ud, "Default")
+                drv = webdriver.Edge(options=opts_tmp)
+                drv.implicitly_wait(2)
+                return drv
+            except Exception as e_tmp:
+                print(f"[错误] 使用临时用户数据目录启动失败：{e_tmp}")
+                # 继续走附加模式回退
+
+        # 情况二：DevToolsActivePort/failed to start/crashed，尝试远程调试附加模式
         if "DevToolsActivePort" in msg or "failed to start" in msg or "crashed" in msg:
             print("[警告] Edge 启动失败（DevToolsActivePort/failed to start/crashed）。尝试以“远程调试附加模式”重新连接…")
             if is_edge_running():
@@ -136,8 +155,9 @@ def build_edge_driver() -> webdriver.Edge:
                 except Exception as e3:
                     print(f"[错误] 使用临时用户数据目录启动也失败：{e3}")
                     raise
-        else:
-            raise e
+
+        # 未识别的异常，直接抛出
+        raise e
 
     if service is None:
         print("[警告] 未找到 driver/msedgedriver.exe，将尝试自动匹配驱动（Selenium Manager）")
@@ -157,7 +177,8 @@ def build_edge_driver() -> webdriver.Edge:
                 except (SessionNotCreatedException, WebDriverException) as e2:
                     driver = _try_attach_mode_on_failure(e2)
             else:
-                raise
+                # 交由统一回退处理（包含“用户数据目录被占用”）
+                driver = _try_attach_mode_on_failure(e)
     driver.implicitly_wait(2)
     return driver
 

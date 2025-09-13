@@ -4,7 +4,7 @@
 
 说明：
 - 从 conf/douyin/product-url.txt 读取商品草稿链接（若不存在则回退 conf/product-url.txt）
-- 从 conf/规格.yml 读取需要创建的“维度”与每个维度的“选项”（顶层键名为维度，缩进的“- 项”为选项）
+- 从 output/ 下最新子目录的 result.yml 读取需要创建的“维度”与每个维度的“选项”（取 specs 段）
 - 打开浏览器访问草稿页，依次点击“添加规格类型”，展开“规格类型下拉按钮”，在下拉列表中选择维度；
   若列表没有该维度，则点击“创建类型”，在弹出的输入框中输入维度名并回车。
 - 代码内全部中文日志与注释，严格参考 “元素示例/” 下的文件来定位元素；录入完所有维度选项后点击“保存草稿”。
@@ -19,7 +19,7 @@ import time
 
 from robocorp.tasks import task
 
-from config import SPECS_YAML_FILE, read_product_url, read_spec_dimensions_with_options
+from config import read_product_url, read_spec_dimensions_from_latest_output, read_price_plan_from_latest_output
 from driver_utils import build_edge_driver, navigate_to_url, wait_for_login_and_page_ready
 from douyin_actions import (
     collect_existing_dimensions,
@@ -28,16 +28,17 @@ from douyin_actions import (
     select_dimension_from_dropdown,
     create_dimension_via_dialog,
     input_options_for_dimension,
+    fill_prices_for_sku_table,
     click_save_draft,
 )
 
 
 @task
 def create_douyin_spec_dimensions() -> None:
-    """创建抖店商品规格维度，并录入每个维度的所有选项，最后保存草稿。"""
+    """创建抖店商品规格维度，并录入每个维度的所有选项；随后根据 result.yml 的价格计划补充 SKU 价格，最后保存草稿。"""
     print("[开始] 抖店-创建规格维度 任务启动…")
     url = read_product_url()
-    dims_map = read_spec_dimensions_with_options(SPECS_YAML_FILE)
+    dims_map = read_spec_dimensions_from_latest_output()
     dims = list(dims_map.keys())
 
     driver = build_edge_driver()
@@ -65,6 +66,17 @@ def create_douyin_spec_dimensions() -> None:
                 input_options_for_dimension(driver, dim, dims_map.get(dim, []))
             except Exception as e:
                 print(f"[警告] 录入维度选项发生异常（维度={dim}）：{e}")
+
+        # 录入 SKU 价格（按 result.yml 的 combos 顺序）
+        try:
+            prices = read_price_plan_from_latest_output()
+            if prices:
+                print("[步骤] 开始为 SKU 表格填写价格…")
+                fill_prices_for_sku_table(driver, prices)
+            else:
+                print("[提示] 未解析到价格计划，将跳过价格填写")
+        except Exception as e:
+            print(f"[警告] 读取或填写价格发生异常：{e}")
 
         # 保存草稿
         click_save_draft(driver)
