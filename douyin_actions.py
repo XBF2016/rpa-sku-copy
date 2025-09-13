@@ -337,12 +337,37 @@ def _find_price_inputs(driver):
     except Exception:
         return []
     try:
+        # 注意：选择器仅匹配“真实可编辑”的输入框，排除虚拟占位/隐藏
         return body.find_elements(
             By.XPATH,
             ".//tr[contains(@class,'ecom-g-table-row') and not(contains(@class,'ecom-g-table-row-extra'))]//td[contains(@class,'attr-column-field_price')]//input[contains(@class,'ecom-g-input-number-input')]",
         )
     except Exception:
         return []
+
+
+def _find_price_entries(driver):
+    """返回 (input_element, row_key) 列表（按 DOM 顺序）。"""
+    entries = []
+    try:
+        body = WebDriverWait(driver, 5).until(EC.presence_of_element_located(X_SKU_TABLE_VIRTUAL_BODY))
+    except Exception:
+        return entries
+    try:
+        inputs = body.find_elements(
+            By.XPATH,
+            ".//tr[contains(@class,'ecom-g-table-row') and not(contains(@class,'ecom-g-table-row-extra'))]//td[contains(@class,'attr-column-field_price')]//input[contains(@class,'ecom-g-input-number-input')]",
+        )
+        for el in inputs:
+            try:
+                tr = el.find_element(By.XPATH, "ancestor::tr[contains(@class,'ecom-g-table-row') and not(contains(@class,'ecom-g-table-row-extra'))]")
+                row_key = (tr.get_attribute("data-row-key") or "").strip()
+            except Exception:
+                row_key = ""
+            entries.append((el, row_key))
+    except Exception:
+        pass
+    return entries
 
 
 def _normalize_price_text(price: float) -> str:
@@ -378,19 +403,24 @@ def fill_prices_for_sku_table(driver, prices: List[float]) -> None:
         print("[提示] 未找到 SKU 表格区域，价格填充将被跳过")
         return
 
-    # 将页面滚动到顶部，尽量与表格顺序对齐
+    # 统一将页面与虚拟体滚到顶部，确保从第一个输入框开始对齐
     try:
         driver.execute_script("window.scrollTo(0, 0);")
     except Exception:
         pass
+    try:
+        driver.execute_script("arguments[0].scrollTop = 0;", body)
+    except Exception:
+        pass
 
     idx = 0  # 已处理到的价格计划索引
+    processed_rows = set()  # 已处理行 key，避免重复写同一行
     stagnant_rounds = 0
     MAX_STAGNANT_ROUNDS = 8
 
     while idx < len(prices):
-        inputs = _find_price_inputs(driver)
-        if not inputs:
+        entries = _find_price_entries(driver)
+        if not entries:
             stagnant_rounds += 1
             if stagnant_rounds >= MAX_STAGNANT_ROUNDS:
                 break
@@ -398,25 +428,21 @@ def fill_prices_for_sku_table(driver, prices: List[float]) -> None:
             continue
 
         stagnant_rounds = 0
-        for inp in inputs:
+        made_progress = False
+        for inp, row_key in entries:
+            if row_key and row_key in processed_rows:
+                continue
             if idx >= len(prices):
                 break
             price = prices[idx]
             idx += 1
-            if price is None:
-                continue
             try:
-                cur_val = (inp.get_attribute("value") or "").strip()
-                try:
-                    cur_num = float(cur_val) if cur_val else 0.0
-                except Exception:
-                    cur_num = 0.0
-                # 已有值且>0，视为已填，跳过
-                if cur_num > 0:
-                    continue
-
-                txt = _normalize_price_text(float(price))
+                txt = _normalize_price_text(float(price)) if price is not None else ""
+                # 无论是否需要填写（null/无效），均视为该行已处理，避免再次覆盖/错位
+                if row_key:
+                    processed_rows.add(row_key)
                 if not txt:
+                    made_progress = True
                     continue
 
                 try:
@@ -438,11 +464,31 @@ def fill_prices_for_sku_table(driver, prices: List[float]) -> None:
                     except Exception:
                         pass
                 inp.send_keys(txt)
-                time.sleep(0.02)
+                time.sleep(0.03)
                 try:
                     inp.send_keys(Keys.ENTER)
                 except Exception:
                     pass
+                # 简单校验，若值不一致，重试一次
+                try:
+                    after = (inp.get_attribute("value") or "").strip()
+                    if after and after != txt:
+                        try:
+                            inp.send_keys(Keys.CONTROL, "a")
+                        except Exception:
+                            try:
+                                inp.clear()
+                            except Exception:
+                                pass
+                        inp.send_keys(txt)
+                        time.sleep(0.03)
+                        try:
+                            inp.send_keys(Keys.ENTER)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                made_progress = True
             except StaleElementReferenceException:
                 continue
             except Exception as e:
@@ -450,13 +496,21 @@ def fill_prices_for_sku_table(driver, prices: List[float]) -> None:
 
         # 滚动以触发后续行渲染
         try:
-            inputs2 = _find_price_inputs(driver)
-            if inputs2:
+            entries2 = _find_price_entries(driver)
+            if entries2:
                 try:
-                    driver.execute_script("arguments[0].scrollIntoView({block:'end'});", inputs2[-1])
+                    driver.execute_script("arguments[0].scrollIntoView({block:'end'});", entries2[-1][0])
                 except Exception:
                     try:
                         driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + 600;", body)
+                    except Exception:
+                        pass
+            if not made_progress:
+                try:
+                    driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + 1000;", body)
+                except Exception:
+                    try:
+                        driver.execute_script("window.scrollBy(0, 800);")
                     except Exception:
                         pass
         except Exception:

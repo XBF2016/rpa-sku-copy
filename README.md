@@ -73,7 +73,7 @@ combos:
   在 Windows PowerShell 中（按照项目规范，带上演示用的环境变量）：
 
   ```powershell
-  $env:MAX_COMBOS=5; python -m robocorp.tasks run .\main.py -t create_douyin_spec_dimensions
+  python -m robocorp.tasks run .\main.py -t create_douyin_spec_dimensions
   ```
 
    说明：
@@ -105,7 +105,7 @@ combos:
 ## 运行日志与幂等
 - 程序会在开始时打印将要创建的维度列表；每一步操作均有中文提示。
 - 对已存在的维度会自动跳过，避免重复创建（幂等）。
- - 价格填写遵循幂等：若对应输入框已有大于 0 的值，则跳过不覆盖；对 `null` 或小于 0.01 的价格也跳过。
+ - 价格填写为“全量覆盖模式”：每次运行都会按 `combos` 顺序为所有可见价格输入框重新输入价格（对 `null` 或小于 0.01 的价格将跳过不填）。
 
 - 若仍然看见“登录过期”，请在浏览器页面内手动完成登录；程序会循环等待，直到检测到“添加规格类型”按钮或超时（默认 10 分钟）。
 

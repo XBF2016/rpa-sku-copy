@@ -227,40 +227,34 @@ def _parse_dims_and_prices_from_result_yml(result_path: Path) -> Tuple[List[str]
                 # 注释行直接跳过
                 if line.lstrip().startswith("#"):
                     continue
-                # 顶层键切换
+                # 顶层键切换（仅在切到其它顶层键时退出 combos/dims）
                 if not line.startswith(" ") and line.strip().endswith(":"):
                     key = line.strip()[:-1].strip()
                     in_dims = (key == "dims")
                     in_combos = (key == "combos")
                     # 进入新段时继续读取下一行
                     continue
-                # 读取 dims
+                # 读取 dims（允许列表项之间穿插空行/注释）
                 if in_dims:
-                    # 只接受形如 "  - 项" 的列表项
                     if line.startswith("  ") and line.lstrip().startswith("-"):
                         dash_idx = line.find("-")
                         val = line[dash_idx + 1 :].strip()
-                        # 去掉包裹引号
                         if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
                             val = val[1:-1]
                         if val:
                             dims.append(val)
                         continue
-                    # 碰到非列表行或缩进不匹配，视为 dims 结束
-                    in_dims = False
-                # 读取 combos
+                    # 其它情况直接忽略，直到遇到新的顶层键
+                # 读取 combos（直到遇到新的顶层键为止）
                 if in_combos:
                     ls = line.lstrip()
                     if ls.startswith("-") and "[" in ls and "]" in ls:
-                        # 提取方括号内容
                         try:
                             content = ls[ls.find("[") : ls.rfind("]") + 1]
-                            # 兼容 yaml 的 null
                             content = content.replace("null", "None")
                             arr = ast.literal_eval(content)
                             if isinstance(arr, (list, tuple)) and len(arr) >= len(dims) + 1:
                                 price = arr[len(dims)]
-                                # 允许 None / 数值
                                 if price is None:
                                     prices.append(None)
                                 else:
@@ -273,13 +267,10 @@ def _parse_dims_and_prices_from_result_yml(result_path: Path) -> Tuple[List[str]
                         except Exception:
                             prices.append(None)
                         continue
-                    # 碰到不是以 "- [" 开头的行，认为 combos 结束
-                    if not (ls.startswith("-") and ("[" in ls)):
-                        in_combos = False
+                    # 非列表行忽略（例如空行），不提前结束 in_combos
         if not dims:
             raise RuntimeError("未能从 result.yml 的 dims 段解析到任何维度，请检查文件结构是否符合预期")
         if not prices:
-            # 允许没有 combos（例如仅有维度与选项），此时返回空价格计划
             print("[提示] result.yml 中未发现 combos 段或未解析到任何价格，价格填充将被跳过")
         return dims, prices
     except Exception as e:
