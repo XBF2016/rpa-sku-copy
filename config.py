@@ -25,7 +25,6 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 
 PRODUCT_URL_FILE_PRI = CONF_DIR / "douyin" / "product-url.txt"
 PRODUCT_URL_FILE_FALLBACK = CONF_DIR / "product-url.txt"
-SPECS_YAML_FILE = CONF_DIR / "规格.yml"
 
 
 def read_browser_path() -> Optional[str]:
@@ -56,45 +55,6 @@ def read_product_url() -> str:
     raise RuntimeError("未找到商品链接，请在 conf/douyin/product-url.txt 或 conf/product-url.txt 填写链接")
 
 
-def read_spec_dimensions_with_options(yaml_path: Path) -> dict:
-    """最简 YAML 解析：
-    - 解析顶层键为维度名；其下缩进行若以 "- " 开头则作为该维度的选项。
-    - 返回 { 维度: [选项1, 选项2, ...] } 的有序字典（按出现顺序）。
-    """
-    if not yaml_path.exists():
-        raise RuntimeError(f"未找到规格配置文件: {yaml_path}")
-    from collections import OrderedDict
-    result = OrderedDict()
-    cur_key = None
-    try:
-        with yaml_path.open("r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.rstrip("\n\r")
-                if not line.strip():
-                    continue
-                if line.lstrip().startswith("#"):
-                    continue
-                # 顶层键：不以空格开头且以冒号结尾
-                if not line.startswith(" ") and line.strip().endswith(":"):
-                    cur_key = line.strip()[:-1].strip()
-                    if cur_key:
-                        result[cur_key] = []
-                    continue
-                # 子项：以连字符列表
-                if cur_key and line.lstrip().startswith("-"):
-                    # 允许任意缩进，但取"- "后的内容
-                    dash_idx = line.find("-")
-                    val = line[dash_idx + 1 :].strip()
-                    if val:
-                        result[cur_key].append(val)
-    except Exception as e:
-        raise RuntimeError(
-            f"解析规格配置失败，请检查 conf/规格.yml 是否为 顶层键: 列表 的结构。错误: {e}"
-        )
-    if not result:
-        raise RuntimeError("未从 conf/规格.yml 解析到任何维度，请确认内容格式")
-    print(f"[信息] 将要创建的规格维度: {list(result.keys())}")
-    return result
 
 
 # -------------------------
